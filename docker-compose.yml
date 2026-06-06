@@ -1,0 +1,247 @@
+# Trip Concierge · 17-service mesh for cohort Session 6.
+#
+# Spin up:   docker compose up --build
+# Tear down: docker compose down -v
+# Healthcheck: ./scripts/preflight.sh
+#
+# Service tiers:
+#   tier 0 · infra      · redis, phoenix
+#   tier 1 · mock APIs  · mock-airline, mock-hotel, mock-payment
+#   tier 2 · workers    · the 9 A2A-speaking agents
+#   tier 3 · planner    · Plan-and-Execute supervisor
+#   tier 4 · voice      · Gemini Live front-end
+#   tier 5 · frontend   · Next.js dashboard
+
+name: agentic-ai-multiagent-orchestration
+
+# ─── reusable env block applied to every Python agent ───
+x-agent-env: &agent-env
+  REDIS_URL: redis://redis:6379/0
+  PHOENIX_COLLECTOR_ENDPOINT: http://phoenix:6006
+  GOOGLE_API_KEY: ${GOOGLE_API_KEY:?GOOGLE_API_KEY required in .env}
+  LANGSMITH_API_KEY: ${LANGSMITH_API_KEY:-}
+  LANGSMITH_PROJECT: ${LANGSMITH_PROJECT:-agentic-ai-multiagent-orchestration}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+# ─── reusable service base applied to every Python agent ───
+x-agent-base: &agent-base
+  build:
+    context: .
+    dockerfile: docker/agent.Dockerfile
+  env_file:
+    - .env
+  restart: unless-stopped
+  networks:
+    - tripnet
+  depends_on:
+    redis:
+      condition: service_healthy
+    phoenix:
+      condition: service_started
+
+services:
+  # ════════════════ tier 0 · infra ════════════════
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+    networks: [tripnet]
+
+  phoenix:
+    image: arizephoenix/phoenix:latest
+    ports: ["6006:6006"]
+    environment:
+      PHOENIX_WORKING_DIR: /tmp/phoenix
+    networks: [tripnet]
+
+  # ════════════════ tier 1 · mock external APIs ════════════════
+  mock-airline-api:
+    build:
+      context: .
+      dockerfile: docker/mock-api.Dockerfile
+      args: { API_NAME: airline }
+    ports: ["9001:9001"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9001/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks: [tripnet]
+
+  mock-hotel-api:
+    build:
+      context: .
+      dockerfile: docker/mock-api.Dockerfile
+      args: { API_NAME: hotel }
+    ports: ["9002:9002"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9002/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks: [tripnet]
+
+  mock-payment-api:
+    build:
+      context: .
+      dockerfile: docker/mock-api.Dockerfile
+      args: { API_NAME: payment }
+    ports: ["9003:9003"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9003/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks: [tripnet]
+
+  # ════════════════ tier 2 · A2A worker agents ════════════════
+  flight-agent:
+    <<: *agent-base
+    command: uvicorn services.flight_agent.main:app --host 0.0.0.0 --port 8010
+    ports: ["8010:8010"]
+    environment:
+      <<: *agent-env
+      AIRLINE_API_URL: http://mock-airline-api:9001
+    depends_on:
+      redis: { condition: service_healthy }
+      phoenix: { condition: service_started }
+      mock-airline-api: { condition: service_healthy }
+
+  hotel-agent:
+    <<: *agent-base
+    command: uvicorn services.hotel_agent.main:app --host 0.0.0.0 --port 8011
+    ports: ["8011:8011"]
+    environment:
+      <<: *agent-env
+      HOTEL_API_URL: http://mock-hotel-api:9002
+    depends_on:
+      redis: { condition: service_healthy }
+      phoenix: { condition: service_started }
+      mock-hotel-api: { condition: service_healthy }
+
+  itinerary-agent:
+    <<: *agent-base
+    command: uvicorn services.itinerary_agent.main:app --host 0.0.0.0 --port 8012
+    ports: ["8012:8012"]
+    environment:
+      <<: *agent-env
+
+  budget-agent:
+    <<: *agent-base
+    command: uvicorn services.budget_agent.main:app --host 0.0.0.0 --port 8013
+    ports: ["8013:8013"]
+    environment:
+      <<: *agent-env
+
+  payment-agent:
+    <<: *agent-base
+    command: uvicorn services.payment_agent.main:app --host 0.0.0.0 --port 8014
+    ports: ["8014:8014"]
+    environment:
+      <<: *agent-env
+      PAYMENT_API_URL: http://mock-payment-api:9003
+    depends_on:
+      redis: { condition: service_healthy }
+      phoenix: { condition: service_started }
+      mock-payment-api: { condition: service_healthy }
+
+  critic-agent:
+    <<: *agent-base
+    command: uvicorn services.critic_agent.main:app --host 0.0.0.0 --port 8015
+    ports: ["8015:8015"]
+    environment:
+      <<: *agent-env
+
+  todo-agent:
+    # Reuses Session 4's ToDoAgent code, A2A-wrapped.
+    <<: *agent-base
+    command: uvicorn services.todo_agent.main:app --host 0.0.0.0 --port 8016
+    ports: ["8016:8016"]
+    environment:
+      <<: *agent-env
+
+  calendar-agent:
+    # Reuses Session 5's gcal MCP server, A2A-wrapped.
+    <<: *agent-base
+    command: uvicorn services.calendar_agent.main:app --host 0.0.0.0 --port 8017
+    ports: ["8017:8017"]
+    environment:
+      <<: *agent-env
+      GOOGLE_TOKEN_PATH: /app/secrets/google-token.json
+      GOOGLE_CREDS_PATH: /app/secrets/google-creds.json
+    volumes:
+      - ./secrets/google-token.json:/app/secrets/google-token.json:ro
+      - ./secrets/google-creds.json:/app/secrets/google-creds.json:ro
+
+  research-agent:
+    <<: *agent-base
+    command: uvicorn services.research_agent.main:app --host 0.0.0.0 --port 8018
+    ports: ["8018:8018"]
+    environment:
+      <<: *agent-env
+
+  # ════════════════ tier 3 · planner (supervisor) ════════════════
+  planner:
+    <<: *agent-base
+    command: uvicorn services.planner.main:app --host 0.0.0.0 --port 8001
+    ports: ["8001:8001"]
+    environment:
+      <<: *agent-env
+      # A2A peer registry — Planner discovers workers via these URLs
+      FLIGHT_AGENT_URL:    http://flight-agent:8010
+      HOTEL_AGENT_URL:     http://hotel-agent:8011
+      ITINERARY_AGENT_URL: http://itinerary-agent:8012
+      BUDGET_AGENT_URL:    http://budget-agent:8013
+      PAYMENT_AGENT_URL:   http://payment-agent:8014
+      CRITIC_AGENT_URL:    http://critic-agent:8015
+      TODO_AGENT_URL:      http://todo-agent:8016
+      CALENDAR_AGENT_URL:  http://calendar-agent:8017
+      RESEARCH_AGENT_URL:  http://research-agent:8018
+    depends_on:
+      redis:            { condition: service_healthy }
+      phoenix:          { condition: service_started }
+      flight-agent:     { condition: service_started }
+      hotel-agent:      { condition: service_started }
+      itinerary-agent:  { condition: service_started }
+      budget-agent:     { condition: service_started }
+      payment-agent:    { condition: service_started }
+      critic-agent:     { condition: service_started }
+      todo-agent:       { condition: service_started }
+      calendar-agent:   { condition: service_started }
+      research-agent:   { condition: service_started }
+
+  # ════════════════ tier 4 · voice front-end ════════════════
+  concierge-voice:
+    <<: *agent-base
+    command: uvicorn services.concierge_voice.main:app --host 0.0.0.0 --port 8000
+    ports: ["8000:8000"]
+    environment:
+      <<: *agent-env
+      PLANNER_URL: http://planner:8001
+      GEMINI_LIVE_MODEL: ${GEMINI_LIVE_MODEL:-gemini-3.1-flash-live}
+      CONCIERGE_VOICE_NAME: ${CONCIERGE_VOICE_NAME:-Charon}
+    depends_on:
+      planner: { condition: service_started }
+
+  # ════════════════ tier 5 · frontend ════════════════
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: ../docker/frontend.Dockerfile
+    ports: ["3000:3000"]
+    environment:
+      NEXT_PUBLIC_VOICE_WS_URL: ws://localhost:8000/voice
+      NEXT_PUBLIC_AGENT_URL:    http://localhost:8001/agent
+      NEXT_PUBLIC_TTS_URL:      http://localhost:8000/tts/stream
+    networks: [tripnet]
+    depends_on:
+      concierge-voice: { condition: service_started }
+      planner:         { condition: service_started }
+
+networks:
+  tripnet:
+    driver: bridge

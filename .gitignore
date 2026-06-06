@@ -1,0 +1,41 @@
+# Secrets
+.env
+secrets/*
+!secrets/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+.uv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Node
+node_modules/
+.next/
+out/
+dist/
+build/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Docker
+.docker/
+
+# Observability local data
+.phoenix/
+phoenix-data/
+
+# Logs
+*.log
