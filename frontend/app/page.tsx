@@ -19,6 +19,7 @@ import { VoiceBar } from "@/components/VoiceBar";
 import { VoiceTranscript } from "@/components/VoiceTranscript";
 import { EmptyState } from "@/components/EmptyState";
 import { ArtifactPanel } from "@/components/ArtifactPanel";
+import { ApprovalModal } from "@/components/ApprovalModal";
 
 export default function HomePage() {
   const turnsCount = useSelector((s: RootState) => s.chat.turns.length);
@@ -49,6 +50,9 @@ export default function HomePage() {
 
         <ArtifactPanel />
       </main>
+
+      {/* Phase 7 · HITL approval modal · renders only when agent paused. */}
+      <ApprovalModal />
     </div>
   );
 }

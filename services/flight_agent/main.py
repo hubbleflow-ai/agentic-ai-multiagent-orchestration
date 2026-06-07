@@ -1,238 +1,246 @@
-"""flight-agent · LLM-generated flight options with structured output.
+"""flight-agent · LangGraph supervisor over mcp-airline, exposed via A2A.
 
-Switched from regex JSON extraction to LangChain's `with_structured_output`,
-which uses Gemini's native function-calling to ENFORCE the Pydantic schema.
-No more parse errors — if Gemini can't produce a valid response, it raises
-a clean ValidationError we catch and return as an A2A error.
+Phase 2 of the Session 6 refactor.  Architecture:
 
-Caches by (origin, destination, depart, return, pax) in Redis with 24h TTL.
+  Planner  ──(A2A: natural-language brief)──▶  flight-agent (this service)
+                                                       │
+                                                       ▼
+                                          LangGraph: model + ToolNode
+                                                       │
+                                       ┌───────────────┴───────────────┐
+                                       │                               │
+                                       ▼                               ▼
+                              search_flights (MCP)             hold_flight (MCP)
+                                       │                               │
+                                       └────────► mcp-airline ◄────────┘
 
-A2A skills:
-  - search_flights(origin, destination, depart_date, return_date, pax, max_budget_inr)
-       → {options, recommended_id, recommended}
-  - hold_flight(flight_id, pax) → {hold_id, expires_at}
+What this service does:
+  1. Connects to mcp-airline at startup · loads its tools as LangChain Tools.
+  2. Builds a LangGraph StateGraph(MessagesState) · model node + ToolNode.
+  3. On each A2A message, the graph reasons over the brief, calls
+     search_flights, picks a recommendation, optionally calls hold_flight.
+  4. Final assistant message is emitted as the A2A response via TaskUpdater.
+
+What this service does NOT do:
+  - It does NOT generate flight inventory itself · that's mcp-airline's job.
+  - It does NOT persist conversation across A2A calls · each request is
+    independent (planner owns the multi-turn state).
+
+Endpoints exposed by `add_a2a_routes_to_fastapi`:
+  GET  /.well-known/agent-card.json   · A2A Agent Card discovery
+  POST /                              · A2A JSON-RPC 2.0 (message/send, etc.)
+  POST /v1/...                        · REST routes (per SDK convention)
+  GET  /health                        · docker-compose health probe (ours)
 """
 
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
 import os
-import uuid
-from datetime import datetime, timedelta, timezone
-from typing import Optional
 
-import redis.asyncio as redis
+from a2a.server.request_handlers import DefaultRequestHandler
+from a2a.server.routes import (
+    add_a2a_routes_to_fastapi,
+    create_agent_card_routes,
+    create_jsonrpc_routes,
+    create_rest_routes,
+)
+from a2a.server.tasks import InMemoryTaskStore
+from a2a.types import (
+    AgentCapabilities,
+    AgentCard,
+    AgentInterface,
+    AgentSkill,
+)
+from a2a.utils import TransportProtocol
 from fastapi import FastAPI
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import SystemMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
-from pydantic import BaseModel, Field
+from langchain_mcp_adapters.client import MultiServerMCPClient
+from langgraph.graph import END, START, MessagesState, StateGraph
+from langgraph.prebuilt import ToolNode
 
-from shared.a2a import A2AServer
+from shared.agent_template import LangGraphA2AExecutor
 from shared.observability import setup_observability
 
 setup_observability("flight-agent")
-
-app = FastAPI(title="flight-agent", version="0.3.0")
-a2a = A2AServer(
-    app,
-    agent_name="flight-agent",
-    description="Searches and holds flights. Structured LLM output, Redis-cached.",
-)
-
 log = logging.getLogger(__name__)
 
-_r = redis.from_url(os.environ.get("REDIS_URL", "redis://redis:6379/0"), decode_responses=True)
-_CACHE_TTL_SECONDS = 24 * 60 * 60
+# ─── config ──────────────────────────────────────────────────────────────
+
+MCP_AIRLINE_URL = os.environ.get("MCP_AIRLINE_URL", "http://mcp-airline:9011/mcp")
+
+# PUBLIC_URL is what the Agent Card advertises to A2A clients. Inside the
+# Docker compose network this is the service DNS name · outside (e.g. from
+# the host) it is localhost. The card always advertises the in-cluster URL
+# since the planner sits inside the network.
+PUBLIC_URL = os.environ.get("FLIGHT_AGENT_PUBLIC_URL", "http://flight-agent:8010/")
 
 
-# ─── structured output schema (enforced by Gemini function-calling) ──────
+# ─── prompt ──────────────────────────────────────────────────────────────
 
-class FlightOption(BaseModel):
-    flight_id: str = Field(description="Airline code + number, e.g. 'AI314' or '6E1503'")
-    airline: str = Field(description="Full airline name, e.g. 'Air India', 'IndiGo'")
-    alliance: str = Field(description="'Star Alliance', 'Oneworld', 'SkyTeam', or 'no alliance'")
-    origin: str = Field(description="3-letter IATA airport code")
-    destination: str = Field(description="3-letter IATA airport code")
-    depart_date: str = Field(description="YYYY-MM-DD")
-    return_date: Optional[str] = Field(None, description="YYYY-MM-DD or null for one-way")
-    dep_time: str = Field(description="HH:MM 24-hour")
-    arr_time: str = Field(description="HH:MM 24-hour, append ' (+1 day)' if next-day")
-    duration_hours: float = Field(description="Total flight duration in hours, e.g. 10.5")
-    stops: int = Field(ge=0, le=3, description="Number of stops, 0 for non-stop")
-    price_per_pax_inr: int = Field(description="Price per passenger in INR")
-    price_total_inr: int = Field(description="Total price = per_pax * pax * (2 if round-trip, 1 if one-way)")
-    pax: int = Field(description="Number of passengers in this booking")
+_SYSTEM = """You are flight-agent · a focused sub-agent specialising in flight discovery
+and booking holds for an Indian travel concierge.
+
+You have these MCP tools available:
+  - search_flights(origin, destination, depart_date, pax, return_date?)
+        → 12 realistic flight options sorted ascending by price_total_inr
+  - hold_flight(flight_id, pax)
+        → places a 30-minute hold on one option
+
+## DECIDE THE BRIEF TYPE FIRST · SEARCH or HOLD
+
+Every brief is one of two types. Classify it before doing anything else.
+
+**SEARCH brief** · examples:
+  "Find me a flight from BLR to NRT on 2026-10-15 for 2 adults"
+  "Search BLR → SYD for Dec 25, 2 adults, under ₹1L"
+  "What are the options for Bengaluru to Tokyo Oct 15?"
+
+**HOLD brief** · examples:
+  "Hold the Malaysia Airlines MH192 for 2 adults"
+  "Book the IndiGo 6E2104 flight"
+  "Lock in the Air India AI143"
+  "Place a hold on Thai TG326"
+
+## SEARCH FLOW
+  1. Parse origin, destination, depart_date, pax (and return_date if
+     round-trip). If something essential is missing, reply with EXACTLY
+     what you need clarified · do NOT guess silently.
+  2. CALL search_flights · this is MANDATORY. Do NOT skip the tool call.
+     Do NOT claim to have searched without calling it · the user's UI
+     only renders cards from the actual tool output.
+  3. From the 12 options, pick a single recommendation and explain WHY in
+     one short paragraph. Lean toward:
+       - non-stop > 1-stop > 2-stop
+       - under-budget > over-budget (if the brief mentions one)
+       - reputable carrier > budget carrier for international long-haul
+     Mention 2 backup options briefly (carrier + price).
+
+## HOLD FLOW
+  1. Extract the flight_id from the brief (e.g. "MH192", "AI314", "6E2104").
+     The pax count is in the brief; if not, default to 2.
+  2. CALL hold_flight(flight_id=..., pax=...) · this is MANDATORY. Do NOT
+     skip the tool call. Do NOT write "I've placed the hold" or "hold
+     confirmed" or anything similar WITHOUT first calling the tool. The
+     user's UI only shows the booking as confirmed when the actual MCP
+     hold_flight tool fires and returns a hold_id.
+  3. After the tool returns, report the hold_id and expiry in 1-2 sentences.
+
+## CRITICAL · NEVER FABRICATE TOOL RESULTS
+- NEVER claim a hold was placed without calling hold_flight.
+- NEVER claim to have searched flights without calling search_flights.
+- NEVER invent flight IDs, prices, hold_ids, or airline names · they must
+  come from the actual tool returns.
+- If you find yourself about to write "I've held the flight" or
+  "I found these options" · STOP, and call the tool first.
+
+## REPLY STYLE
+Concise natural language · 4-6 sentences total, no markdown headings or
+long bullet lists.
+"""
 
 
-class FlightOptionsResponse(BaseModel):
-    options: list[FlightOption] = Field(description="Exactly 12 realistic flight options, sorted by total price ascending")
+# ─── graph (built lazily on first request because MCP load is async) ─────
+
+async def _build_graph():
+    log.info("flight-agent · loading MCP tools from %s", MCP_AIRLINE_URL)
+    mcp_client = MultiServerMCPClient({
+        "airline": {
+            "transport": "streamable_http",
+            "url": MCP_AIRLINE_URL,
+        }
+    })
+    tools = await mcp_client.get_tools()
+    log.info("flight-agent · loaded %d tools: %s", len(tools), [t.name for t in tools])
+
+    llm = ChatGoogleGenerativeAI(
+        model=os.environ.get("GEMINI_MODEL", "gemini-3.5-flash"),
+        temperature=0.2,
+    ).bind_tools(tools)
+
+    async def model_node(state: MessagesState):
+        msgs = [SystemMessage(content=_SYSTEM), *state["messages"]]
+        response = await llm.ainvoke(msgs)
+        return {"messages": [response]}
+
+    def should_continue(state: MessagesState) -> str:
+        last = state["messages"][-1]
+        if getattr(last, "tool_calls", None):
+            return "tools"
+        return END
+
+    graph = StateGraph(MessagesState)
+    graph.add_node("model", model_node)
+    graph.add_node("tools", ToolNode(tools))
+    graph.add_edge(START, "model")
+    graph.add_conditional_edges("model", should_continue, {"tools": "tools", END: END})
+    graph.add_edge("tools", "model")
+
+    return graph.compile()
 
 
-_llm = ChatGoogleGenerativeAI(
-    model=os.environ.get("GEMINI_MODEL", "gemini-3.5-flash"),
-    temperature=0.4,
+# ─── A2A Agent Card ──────────────────────────────────────────────────────
+
+agent_card = AgentCard(
+    name="flight-agent",
+    description=(
+        "Flight discovery and booking-hold specialist. Given a natural-language "
+        "brief (e.g. 'BLR to NRT, Oct 15, 2 adults, prefer non-stop, under ₹1.5L'), "
+        "searches 12 realistic options via mcp-airline, recommends one with "
+        "reasoning, and can place a 30-min hold on confirm."
+    ),
+    version="1.0.0",
+    default_input_modes=["text/plain"],
+    default_output_modes=["text/plain"],
+    supported_interfaces=[
+        AgentInterface(
+            url=PUBLIC_URL,
+            protocol_binding=TransportProtocol.JSONRPC.value,
+            protocol_version="1.0",
+        ),
+    ],
+    capabilities=AgentCapabilities(streaming=False),
+    skills=[
+        AgentSkill(
+            id="search_and_recommend_flight",
+            name="Search & recommend flight",
+            description=(
+                "Search 12 flight options for a route + dates, recommend one "
+                "with reasoning, and place a 30-min hold if asked."
+            ),
+            tags=["flight", "travel", "booking", "search"],
+            examples=[
+                "Find me a non-stop flight from BLR to NRT on 2026-10-15 "
+                "for 2 adults under ₹1.5L total.",
+                "Hold the Air India non-stop from your last recommendation.",
+            ],
+        )
+    ],
 )
-_structured_llm = _llm.with_structured_output(FlightOptionsResponse)
 
 
-# ─── prompts ─────────────────────────────────────────────────────────────
+# ─── FastAPI app + A2A routes ────────────────────────────────────────────
 
-_SYSTEM = """You generate realistic flight inventory for an Indian travel concierge.
-For ANY origin-destination route, produce 12 plausible flight options that match
-the criteria, varying carriers, times, stops, and prices realistically.
+executor = LangGraphA2AExecutor(_build_graph, agent_name="flight-agent")
+handler = DefaultRequestHandler(
+    agent_executor=executor,
+    task_store=InMemoryTaskStore(),
+    agent_card=agent_card,
+)
 
-Carrier mix:
-  - Indian carriers: Air India, IndiGo, Vistara, Akasa, SpiceJet, Air India Express
-  - International: ANA, Japan Airlines, Singapore Airlines, Emirates, Lufthansa,
-    British Airways, Cathay Pacific, Thai Airways, Etihad
+app = FastAPI(title="flight-agent", version="1.0.0")
 
-Pricing realism (INR per pax, one-way unless noted):
-  - Domestic India short-haul: ₹3,500 - ₹9,000
-  - Domestic India long: ₹6,000 - ₹14,000
-  - India ↔ SE Asia (Bali, Bangkok, Singapore): ₹18,000 - ₹35,000
-  - India ↔ Japan / Korea: ₹38,000 - ₹70,000
-  - India ↔ Europe: ₹45,000 - ₹90,000
-  - India ↔ Middle East: ₹15,000 - ₹30,000
-
-Time realism:
-  - Non-stop India ↔ Japan: ~9-10 hours
-  - 1-stop with reasonable layover: add 3-6 hours
-  - Domestic India: 1-3 hours
-
-Stops: ~60% non-stop, ~30% 1-stop, ~10% 2-stop.
-Departure times: spread across morning / afternoon / evening / night.
-"""
+add_a2a_routes_to_fastapi(
+    app,
+    agent_card_routes=create_agent_card_routes(agent_card),
+    jsonrpc_routes=create_jsonrpc_routes(handler, rpc_url="/"),
+    rest_routes=create_rest_routes(handler),
+)
 
 
-def _example_for(origin: str, destination: str, depart: str, ret: str | None, pax: int) -> str:
-    one_way = not ret
-    multiplier = 1 if one_way else 2
-    # A single concrete example calibrates the model's price + time sense
-    # without constraining its option diversity.
-    example = {
-        "flight_id": "AI314",
-        "airline": "Air India",
-        "alliance": "Star Alliance",
-        "origin": origin,
-        "destination": destination,
-        "depart_date": depart,
-        "return_date": ret if not one_way else None,
-        "dep_time": "10:30",
-        "arr_time": "22:15 (+1 day)" if destination in ("NRT", "HND", "LHR", "JFK") else "13:45",
-        "duration_hours": 10.5 if destination in ("NRT", "HND", "LHR", "JFK") else 3.0,
-        "stops": 0,
-        "price_per_pax_inr": 52000,
-        "price_total_inr": 52000 * pax * multiplier,
-        "pax": pax,
-    }
-    return json.dumps(example, indent=2)
-
-
-def _user_prompt(origin: str, destination: str, depart: str, ret: str | None, pax: int) -> str:
-    multiplier_note = "× 2 (round trip)" if ret else "× 1 (one-way)"
-    return f"""Generate 12 flight options for:
-
-  origin: {origin}
-  destination: {destination}
-  depart_date: {depart}
-  return_date: {ret if ret else 'null (one-way)'}
-  pax: {pax}
-
-Vary carriers, times, stops, and prices realistically. Sort ascending by
-price_total_inr.
-
-Reference example for ONE option (use as a calibration, not a template — your
-12 options should be DIFFERENT carriers / times / prices / stops):
-
-{_example_for(origin, destination, depart, ret, pax)}
-
-For each option:
-  - price_total_inr = price_per_pax_inr × pax {multiplier_note}
-"""
-
-
-# ─── caching ─────────────────────────────────────────────────────────────
-
-def _cache_key(origin: str, destination: str, depart: str, ret: str, pax: int) -> str:
-    base = f"{origin}|{destination}|{depart}|{ret}|{pax}"
-    h = hashlib.md5(base.encode()).hexdigest()[:12]
-    return f"flight-options:{h}"
-
-
-async def _generate_options(
-    origin: str, destination: str, depart: str, ret: str | None, pax: int,
-) -> list[dict]:
-    response = await _structured_llm.ainvoke([
-        SystemMessage(content=_SYSTEM),
-        HumanMessage(content=_user_prompt(origin, destination, depart, ret, pax)),
-    ])
-    # response is a validated FlightOptionsResponse instance.
-    return [o.model_dump() for o in response.options]
-
-
-# ─── HTTP ────────────────────────────────────────────────────────────────
+# ─── health probe for docker-compose ─────────────────────────────────────
 
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok", "service": "flight-agent"}
-
-
-@a2a.skill("search_flights")
-async def search_flights(payload: dict) -> dict:
-    origin = (payload.get("origin") or "BLR").upper()
-    destination = (payload.get("destination") or "NRT").upper()
-    depart_date = payload.get("depart_date") or "2026-10-15"
-    return_date = payload.get("return_date") or ""
-    pax = int(payload.get("pax", 2))
-    max_budget_inr = payload.get("max_budget_inr")
-
-    key = _cache_key(origin, destination, depart_date, return_date, pax)
-
-    cached_raw = await _r.get(key)
-    if cached_raw:
-        log.info("flight.cache.hit key=%s", key)
-        options = json.loads(cached_raw)
-    else:
-        log.info("flight.cache.miss key=%s · structured LLM call", key)
-        try:
-            options = await _generate_options(
-                origin, destination, depart_date, return_date or None, pax,
-            )
-        except Exception as e:
-            log.exception("flight.generate.failed")
-            return {
-                "options": [],
-                "recommended_id": None,
-                "recommended": None,
-                "error": f"could not generate flight options: {e}",
-            }
-        await _r.setex(key, _CACHE_TTL_SECONDS, json.dumps(options))
-
-    # Recommend: cheapest under budget, else cheapest overall.
-    candidates = options
-    if max_budget_inr:
-        in_budget = [o for o in options if o.get("price_total_inr", 0) <= int(max_budget_inr)]
-        candidates = in_budget if in_budget else options
-    recommended = min(candidates, key=lambda o: o.get("price_total_inr", 0)) if candidates else None
-
-    return {
-        "options": options,
-        "recommended_id": recommended["flight_id"] if recommended else None,
-        "recommended": recommended,
-    }
-
-
-@a2a.skill("hold_flight")
-async def hold_flight(payload: dict) -> dict:
-    flight_id = payload["flight_id"]
-    pax = int(payload.get("pax", 2))
-    expires = datetime.now(timezone.utc) + timedelta(minutes=30)
-    return {
-        "hold_id": f"HLD-{uuid.uuid4().hex[:8].upper()}",
-        "flight_id": flight_id,
-        "pax": pax,
-        "expires_at": expires.isoformat(),
-        "status": "held",
-    }

@@ -1,0 +1,14 @@
+{
+  "jsonrpc": "2.0",
+  "id": "hold-diag-1",
+  "method": "SendMessage",
+  "params": {
+    "message": {
+      "messageId": "hold-msg-1",
+      "role": "ROLE_USER",
+      "parts": [
+        {"text": "Hold the Malaysia Airlines MH192 flight from BLR to SYD on 2026-12-25 for 2 adults."}
+      ]
+    }
+  }
+}
