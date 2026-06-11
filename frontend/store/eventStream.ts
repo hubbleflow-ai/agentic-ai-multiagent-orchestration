@@ -19,7 +19,7 @@
  */
 
 import type { AppDispatch, RootState } from ".";
-import { streamAgent, type AgentEvent } from "@/lib/api";
+import { streamAgent, resumeAgent, cancelAgent, type AgentEvent } from "@/lib/api";
 import {
   pushUserTurn,
   pushAssistantTurn,
@@ -34,6 +34,8 @@ import {
   setPhase,
   toolFinished,
   toolStarted,
+  setPendingApproval,
+  setApprovalStatus,
 } from "./agentSlice";
 import {
   startFlightSearch,
@@ -126,6 +128,67 @@ function applyToolResultToTrip(
       }
       return true;
     }
+    case "delegate_to_flight_agent": {
+      // Phase 3.5 · A2A artifacts. The sub-agent emits one Artifact per
+      // tool call (search_flights / hold_flight) carrying a DataPart with
+      // the structured payload. The Planner forwards the whole envelope
+      // here as {text, artifacts: [{name, data}, ...]}. We pluck the
+      // structured data and dispatch the SAME trip-store actions that
+      // used to fire on direct search_flights / hold_flight tool events.
+      //
+      // Protobuf Value note: ints came through as floats (TS doesn't
+      // distinguish, so the cards render fine).
+      const artifacts = Array.isArray(r.artifacts) ? r.artifacts : [];
+      let any = false;
+      for (const art of artifacts) {
+        const name = String(art?.name ?? "");
+        const data = art?.data ?? null;
+        if (!data || typeof data !== "object") continue;
+
+        if (name === "search_flights") {
+          // mcp-airline.search_flights returns a list of FlightOption; our
+          // executor wraps top-level lists in {"result": [...]} so DataPart
+          // always serialises from a JSON object. Frontend reads both shapes.
+          const options = (data.result ?? data.options ?? []) as FlightOption[];
+          if (!options.length) continue;
+          const first = options[0];
+          if (!first?.origin || !first?.destination || !first?.depart_date) continue;
+          const key = flightSegmentKey(first.origin, first.destination, first.depart_date);
+          dispatch(startFlightSearch({
+            key,
+            origin: first.origin,
+            destination: first.destination,
+            depart_date: first.depart_date,
+            return_date: first.return_date ?? null,
+          }));
+          // Sub-agent's recommendation isn't surfaced through artifacts yet
+          // (the prose summary in `text` is where it lives). Default to the
+          // first option (cheapest, since mcp-airline sorts ascending).
+          dispatch(finishFlightSearch({
+            key,
+            options,
+            recommendedId: options[0].flight_id,
+          }));
+          any = true;
+        }
+        if (name === "hold_flight") {
+          // MCP TextContent wraps each return value in a list-of-blocks ·
+          // for single-value tools that yields `data.result` as a 1-element
+          // array. Take [0] when array, fall back to object/data otherwise.
+          const raw = data.result ?? data;
+          const held = (Array.isArray(raw) ? raw[0] : raw) as
+            | Record<string, unknown>
+            | undefined;
+          const flightId = held?.flight_id as string | undefined;
+          const holdId = held?.hold_id as string | undefined;
+          if (flightId && holdId) {
+            dispatch(holdFlightById({ flight_id: flightId, hold_id: holdId }));
+            any = true;
+          }
+        }
+      }
+      return any;
+    }
     case "search_hotels": {
       const city = String(args.city ?? r.options?.[0]?.city ?? "");
       const check_in = String(args.check_in ?? "");
@@ -144,6 +207,56 @@ function applyToolResultToTrip(
       }
       return true;
     }
+    case "delegate_to_hotel_agent": {
+      // Phase 4 · same artifact pattern as delegate_to_flight_agent.
+      // Sub-agent emits one Artifact per MCP tool call (search_hotels /
+      // hold_hotel) carrying a DataPart with the structured payload.
+      const artifacts = Array.isArray(r.artifacts) ? r.artifacts : [];
+      let any = false;
+      for (const art of artifacts) {
+        const name = String(art?.name ?? "");
+        const data = art?.data ?? null;
+        if (!data || typeof data !== "object") continue;
+
+        if (name === "search_hotels") {
+          const options = (data.result ?? data.options ?? []) as HotelOption[];
+          if (!options.length) continue;
+          const first = options[0] as any;
+          const city = String(first?.city ?? "");
+          // mcp-hotel stamps check_in / check_out on every option from the
+          // call args so consumers can key by stay.
+          const checkIn = String(first?.check_in ?? "");
+          const checkOut = String(first?.check_out ?? "");
+          if (!city || !checkIn || !checkOut) continue;
+          const key = hotelStayKey(city, checkIn, checkOut);
+          dispatch(startHotelSearch({
+            key,
+            city,
+            check_in: checkIn,
+            check_out: checkOut,
+          }));
+          dispatch(finishHotelSearch({
+            key,
+            options,
+            recommendedId: options[0].hotel_id,
+          }));
+          any = true;
+        }
+        if (name === "hold_hotel") {
+          const raw = data.result ?? data;
+          const held = (Array.isArray(raw) ? raw[0] : raw) as
+            | Record<string, unknown>
+            | undefined;
+          const hotelId = held?.hotel_id as string | undefined;
+          const holdId = held?.hold_id as string | undefined;
+          if (hotelId && holdId) {
+            dispatch(holdHotelById({ hotel_id: hotelId, hold_id: holdId }));
+            any = true;
+          }
+        }
+      }
+      return any;
+    }
     case "build_itinerary":
     case "revise_itinerary": {
       if (Array.isArray(r.days) && r.city) {
@@ -151,6 +264,49 @@ function applyToolResultToTrip(
         return true;
       }
       return false;
+    }
+    case "delegate_to_itinerary_agent": {
+      // Phase 4 closer · itinerary-agent emits build_itinerary or
+      // revise_itinerary artifacts via mcp-trip-state. Both carry the
+      // same {city, days[]} shape.
+      const artifacts = Array.isArray(r.artifacts) ? r.artifacts : [];
+      let any = false;
+      for (const art of artifacts) {
+        const name = String(art?.name ?? "");
+        const data = art?.data ?? null;
+        if (!data || typeof data !== "object") continue;
+        if (name !== "build_itinerary" && name !== "revise_itinerary") continue;
+        // mcp-trip-state returns a Pydantic model; executor wraps non-dict
+        // shapes in {result:...} but Pydantic dicts pass through.
+        const payload = (data.result ?? data) as Record<string, any>;
+        const city = payload?.city as string | undefined;
+        const days = payload?.days;
+        if (city && Array.isArray(days)) {
+          dispatch(upsertItinerary({ city, days }));
+          any = true;
+        }
+      }
+      return any;
+    }
+    case "delegate_to_todo_agent": {
+      // Phase 4 closer · todo-agent emits create_todos artifact via
+      // mcp-trip-state. Shape: {count, todos: [{id, text, priority, due_date}]}.
+      const artifacts = Array.isArray(r.artifacts) ? r.artifacts : [];
+      let any = false;
+      for (const art of artifacts) {
+        const name = String(art?.name ?? "");
+        const data = art?.data ?? null;
+        if (!data || typeof data !== "object") continue;
+        if (name !== "create_todos") continue;
+        const payload = (data.result ?? data) as Record<string, any>;
+        const todos = payload?.todos;
+        const count = payload?.count;
+        if (Array.isArray(todos)) {
+          dispatch(setTodos({ count: Number(count ?? todos.length), items: todos }));
+          any = true;
+        }
+      }
+      return any;
     }
     case "set_budget":
     case "commit_spend":
@@ -288,6 +444,17 @@ export function runAgent(message: string) {
             dispatch(setLatestAssistantError(ev.data.message ?? "Unknown error"));
             break;
 
+          case "agent.interrupt":
+            // Phase 7 · LangGraph paused at capture_payment. Stamp the
+            // pending approval state · the modal mounts on this.
+            dispatch(setPendingApproval({
+              kind: "payment_approval",
+              authId: ev.data.auth_id,
+              amountInr: ev.data.amount_inr,
+              status: "pending",
+            }));
+            break;
+
           case "run.complete":
             break;
         }
@@ -303,9 +470,163 @@ export function runAgent(message: string) {
         dispatch(attachToolsToLatestAssistant({ tools: liveTools }));
         dispatch(clearLiveTools());
       }
-      dispatch(setPhase("done"));
-      // Don't push a final empty turn — segments already pushed.
+      // If the run paused at the HITL gate, keep phase=awaiting_approval ·
+      // we WILL come back via resumeAgentRun/cancelAgentRun. Otherwise we're
+      // done.
+      const stillPaused = getState().agent.pendingApproval !== null;
+      if (!stillPaused) {
+        dispatch(setPhase("done"));
+      }
       dispatch(resetForNewRun());
+    }
+  };
+}
+
+
+// ─── Phase 7 · HITL approval flow ──────────────────────────────────────
+//
+// runAgent (above) is the LLM-initiated turn. The user can also trigger
+// runs via the HITL approval modal: clicking Approve calls resumeAgentRun,
+// clicking Cancel calls cancelAgentRun. Both reuse the same per-event
+// handler as runAgent · code duplication is intentional for clarity over
+// the alternative (factoring a shared handler creates re-entrancy issues
+// with the audio/segment counters).
+
+export function resumeAgentRun() {
+  return async (dispatch: AppDispatch, getState: () => RootState) => {
+    const sessionId = getState().chat.sessionId;
+    dispatch(setApprovalStatus("approving"));
+    dispatch(setPhase("thinking"));
+    try {
+      await resumeAgent(sessionId, _handleStreamEvent(dispatch, getState));
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      dispatch(setError(msg));
+      dispatch(setLatestAssistantError(msg));
+    } finally {
+      const liveTools = getState().agent.toolChain;
+      if (liveTools.length > 0) {
+        dispatch(attachToolsToLatestAssistant({ tools: liveTools }));
+        dispatch(clearLiveTools());
+      }
+      const stillPaused = getState().agent.pendingApproval?.status === "approving";
+      if (stillPaused) {
+        // Approve sequence completed without re-pausing → clear modal.
+        dispatch(setPendingApproval(null));
+      }
+      dispatch(setPhase("done"));
+      dispatch(resetForNewRun());
+    }
+  };
+}
+
+export function cancelAgentRun() {
+  return async (dispatch: AppDispatch, getState: () => RootState) => {
+    const sessionId = getState().chat.sessionId;
+    dispatch(setApprovalStatus("cancelling"));
+    dispatch(setPhase("thinking"));
+    try {
+      await cancelAgent(sessionId, _handleStreamEvent(dispatch, getState));
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      dispatch(setError(msg));
+      dispatch(setLatestAssistantError(msg));
+    } finally {
+      const liveTools = getState().agent.toolChain;
+      if (liveTools.length > 0) {
+        dispatch(attachToolsToLatestAssistant({ tools: liveTools }));
+        dispatch(clearLiveTools());
+      }
+      // Cancel always clears the modal · the model's reaction message is
+      // already in the chat by now.
+      dispatch(setPendingApproval(null));
+      dispatch(setPhase("done"));
+      dispatch(resetForNewRun());
+    }
+  };
+}
+
+
+/** Factored per-event handler used by resumeAgentRun / cancelAgentRun.
+ *  (runAgent has its own inline copy · keeping it explicit so the user
+ *  message dispatch + reset ordering stays local to that path.) */
+function _handleStreamEvent(
+  dispatch: AppDispatch,
+  getState: () => RootState,
+): (ev: AgentEvent) => void {
+  return (ev: AgentEvent) => {
+    switch (ev.event) {
+      case "state.phase":
+        dispatch(setPhase(ev.data.phase));
+        break;
+      case "tool.started": {
+        const args = ev.data.args ?? {};
+        dispatch(toolStarted({ name: ev.data.name, args }));
+        if (applyToolStartedToTrip(dispatch, ev.data.name, args)) {
+          dispatch(notifyPanelUpdate());
+        }
+        break;
+      }
+      case "tool.finished": {
+        const beforeChain = getState().agent.toolChain;
+        const lastRunning = [...beforeChain]
+          .reverse()
+          .find((t) => t.name === ev.data.name && t.status === "running");
+        const callArgs = lastRunning?.args ?? {};
+        dispatch(toolFinished({ name: ev.data.name, result: ev.data.result }));
+        if (applyToolResultToTrip(dispatch, ev.data.name, callArgs, ev.data.result)) {
+          dispatch(notifyPanelUpdate());
+        }
+        break;
+      }
+      case "agent.message_segment": {
+        const { segment_id, content, reasoning } = ev.data;
+        const liveTools = getState().agent.toolChain;
+        if (liveTools.length > 0) {
+          dispatch(attachToolsToLatestAssistant({ tools: liveTools }));
+          dispatch(clearLiveTools());
+        }
+        // Match runAgent's call shape · toolChain + error are required fields.
+        if ((content && content.trim()) || (reasoning && reasoning.trim())) {
+          dispatch(pushAssistantTurn({
+            id: segment_id,
+            content: content || "",
+            reasoning: reasoning || "",
+            toolChain: [],
+            error: null,
+          }));
+        }
+        break;
+      }
+      case "agent.audio_chunk": {
+        if (getState().voice.mode !== "on") break;
+        playAudioChunk(ev.data.segment_id, ev.data.data);
+        dispatch(setSpeaking(true));
+        dispatch(setSpokenMessageId(ev.data.segment_id));
+        break;
+      }
+      case "agent.audio_done": {
+        if (getState().voice.mode !== "on") break;
+        finalizeAudioSegment(ev.data.segment_id, {
+          onSegmentEnd: () => { /* per-segment noop */ },
+          onAllDone: () => { dispatch(setSpeaking(false)); },
+        });
+        break;
+      }
+      case "error":
+        dispatch(setError(ev.data.message ?? "Unknown error"));
+        dispatch(setLatestAssistantError(ev.data.message ?? "Unknown error"));
+        break;
+      case "agent.interrupt":
+        dispatch(setPendingApproval({
+          kind: "payment_approval",
+          authId: ev.data.auth_id,
+          amountInr: ev.data.amount_inr,
+          status: "pending",
+        }));
+        break;
+      case "run.complete":
+        break;
     }
   };
 }

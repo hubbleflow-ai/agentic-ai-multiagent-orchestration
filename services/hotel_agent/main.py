@@ -1,213 +1,245 @@
-"""hotel-agent · LLM-generated hotel options with structured output.
+"""hotel-agent · LangGraph supervisor over mcp-hotel, exposed via A2A.
 
-Same pattern as flight_agent: with_structured_output enforces the schema
-via Gemini's native function calling. Cached in Redis by (city, dates, pax).
+Phase 4 of the Session 6 refactor.  Mirrors flight-agent.
 
-A2A skills:
-  - search_hotels(city, check_in, check_out, pax, max_per_night_inr?) → {options, recommended_id, recommended}
-  - hold_hotel(hotel_id, check_in, check_out) → {hold_id, ...}
+  Planner  ──(A2A: natural-language brief)──▶  hotel-agent (this service)
+                                                       │
+                                                       ▼
+                                          LangGraph: model + ToolNode
+                                                       │
+                                       ┌───────────────┴───────────────┐
+                                       │                               │
+                                       ▼                               ▼
+                              search_hotels (MCP)              hold_hotel (MCP)
+                                       │                               │
+                                       └────────► mcp-hotel  ◄─────────┘
+
+Endpoints exposed by `add_a2a_routes_to_fastapi`:
+  GET  /.well-known/agent-card.json   · A2A Agent Card discovery
+  POST /                              · A2A JSON-RPC 2.0 (SendMessage, etc.)
+  GET  /health                        · docker-compose health probe (ours)
 """
 
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
 import os
-import uuid
-from datetime import date, datetime, timedelta, timezone
 
-import redis.asyncio as redis
+from a2a.server.request_handlers import DefaultRequestHandler
+from a2a.server.routes import (
+    add_a2a_routes_to_fastapi,
+    create_agent_card_routes,
+    create_jsonrpc_routes,
+    create_rest_routes,
+)
+from a2a.server.tasks import InMemoryTaskStore
+from a2a.types import (
+    AgentCapabilities,
+    AgentCard,
+    AgentInterface,
+    AgentSkill,
+)
+from a2a.utils import TransportProtocol
 from fastapi import FastAPI
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import SystemMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
-from pydantic import BaseModel, Field
+from langchain_mcp_adapters.client import MultiServerMCPClient
+from langgraph.graph import END, START, MessagesState, StateGraph
+from langgraph.prebuilt import ToolNode
 
-from shared.a2a import A2AServer
+from shared.agent_template import LangGraphA2AExecutor
 from shared.observability import setup_observability
 
 setup_observability("hotel-agent")
-
-app = FastAPI(title="hotel-agent", version="0.3.0")
-a2a = A2AServer(
-    app,
-    agent_name="hotel-agent",
-    description="Searches and holds hotels. Structured LLM output, Redis-cached.",
-)
-
 log = logging.getLogger(__name__)
 
-_r = redis.from_url(os.environ.get("REDIS_URL", "redis://redis:6379/0"), decode_responses=True)
-_CACHE_TTL_SECONDS = 24 * 60 * 60
+# ─── config ──────────────────────────────────────────────────────────────
+
+MCP_HOTEL_URL = os.environ.get("MCP_HOTEL_URL", "http://mcp-hotel:9012/mcp")
+PUBLIC_URL = os.environ.get("HOTEL_AGENT_PUBLIC_URL", "http://hotel-agent:8011/")
 
 
-# ─── structured output schema ────────────────────────────────────────────
+# ─── prompt ──────────────────────────────────────────────────────────────
 
-class HotelOption(BaseModel):
-    hotel_id: str = Field(description="Short id like 'HTL-TOK-001'")
-    name: str = Field(description="Realistic hotel name")
-    city: str
-    neighborhood: str = Field(description="Specific neighborhood / area name")
-    rating: float = Field(ge=3.0, le=5.0, description="Star rating 3.0-5.0")
-    amenities: list[str] = Field(description="2-4 short tags like 'pool', 'spa', 'beach', 'rooftop'")
-    per_night_inr: int
-    nights: int
-    total_inr: int = Field(description="per_night_inr × nights")
-    pax: int
+_SYSTEM = """You are hotel-agent · a focused sub-agent specialising in hotel discovery
+and booking holds for an Indian travel concierge.
+
+You have these MCP tools available:
+  - search_hotels(city, check_in, check_out, pax, max_per_night_inr?)
+        → 12 realistic hotel options sorted by rating descending
+  - hold_hotel(hotel_id, check_in, check_out)
+        → places a 30-minute hold on one option
+
+## DECIDE THE BRIEF TYPE FIRST · SEARCH or HOLD
+
+Every brief is one of two types. Classify it before doing anything else.
+
+**SEARCH brief** · examples:
+  "Find me a hotel in Tokyo from Oct 15 to Oct 19 for 2 adults"
+  "Search hotels in Goa 26-30 Dec, 2 adults, under ₹10k per night"
+  "What are the hotel options for Paris next month?"
+
+**HOLD brief** · examples:
+  "Hold the Park Hyatt Shinjuku from Oct 15 to Oct 19"
+  "Book the HTL-TOK-003 for check-in 2026-10-15, check-out 2026-10-19"
+  "Lock in the Trunk Hotel for those dates"
+
+## SEARCH FLOW
+  1. Parse city, check_in, check_out, pax (and max_per_night_inr if user
+     mentioned a per-night budget). If something essential is missing,
+     reply with EXACTLY what you need clarified · do NOT guess silently.
+  2. CALL search_hotels · this is MANDATORY. Do NOT skip the tool call.
+     Do NOT claim to have searched without calling it · the user's UI
+     only renders cards from the actual tool output.
+  3. From the 12 options, pick a single recommendation and explain WHY in
+     one short paragraph. Lean toward:
+       - higher rating > lower rating
+       - under-budget > over-budget (if the brief mentions one)
+       - central / convenient neighborhood
+       - well-known reputable chain or boutique that fits the vibe
+     Mention 2 backup options briefly (name + per-night price).
+
+## HOLD FLOW
+  1. Extract the hotel_id (e.g. "HTL-TOK-001") OR the hotel name from the
+     brief. Extract check_in and check_out dates.
+  2. CALL hold_hotel(hotel_id=..., check_in=..., check_out=...) · this is
+     MANDATORY. Do NOT skip the tool call. Do NOT write "I've placed the
+     hold" or "booked" or anything similar WITHOUT first calling the
+     tool. The user's UI only shows the booking as confirmed when the
+     actual MCP hold_hotel tool fires and returns a hold_id.
+  3. After the tool returns, report the hold_id and expiry in 1-2 sentences.
+
+## CRITICAL · NEVER FABRICATE TOOL RESULTS
+- NEVER claim a hold was placed without calling hold_hotel.
+- NEVER claim to have searched hotels without calling search_hotels.
+- NEVER invent hotel IDs, prices, hold_ids, or hotel names · they must
+  come from the actual tool returns.
+- If you find yourself about to write "I've held the hotel" or "I found
+  these options" · STOP, and call the tool first.
+
+## REPLY STYLE
+Concise natural language · 4-6 sentences total, no markdown headings or
+long bullet lists.
+"""
 
 
-class HotelOptionsResponse(BaseModel):
-    options: list[HotelOption] = Field(description="Exactly 12 realistic hotel options, sorted by rating descending")
+# ─── graph (built lazily on first request) ───────────────────────────────
+
+async def _build_graph():
+    log.info("hotel-agent · loading MCP tools from %s", MCP_HOTEL_URL)
+    mcp_client = MultiServerMCPClient({
+        "hotel": {
+            "transport": "streamable_http",
+            "url": MCP_HOTEL_URL,
+        }
+    })
+    tools = await mcp_client.get_tools()
+    log.info("hotel-agent · loaded %d tools: %s", len(tools), [t.name for t in tools])
+
+    llm = ChatGoogleGenerativeAI(
+        model=os.environ.get("GEMINI_MODEL", "gemini-3.5-flash"),
+        temperature=0.2,
+    ).bind_tools(tools)
+
+    async def model_node(state: MessagesState):
+        msgs = [SystemMessage(content=_SYSTEM), *state["messages"]]
+        response = await llm.ainvoke(msgs)
+        return {"messages": [response]}
+
+    def should_continue(state: MessagesState) -> str:
+        last = state["messages"][-1]
+        if getattr(last, "tool_calls", None):
+            return "tools"
+        return END
+
+    graph = StateGraph(MessagesState)
+    graph.add_node("model", model_node)
+    graph.add_node("tools", ToolNode(tools))
+    graph.add_edge(START, "model")
+    graph.add_conditional_edges("model", should_continue, {"tools": "tools", END: END})
+    graph.add_edge("tools", "model")
+
+    return graph.compile()
 
 
-_llm = ChatGoogleGenerativeAI(
-    model=os.environ.get("GEMINI_MODEL", "gemini-3.5-flash"),
-    temperature=0.4,
+# ─── A2A Agent Card ──────────────────────────────────────────────────────
+
+agent_card = AgentCard(
+    # Top-level description is the EXACT text from the OLD
+    # delegate_to_hotel_agent docstring in planner's tools.py.
+    name="hotel-agent",
+    description=(
+        "Delegate a hotel-related task to the hotel specialist sub-agent (A2A).\n\n"
+        "Same pattern as delegate_to_flight_agent. ONE city stay per call ·\n"
+        "NEVER bundle multiple stays. UI renders hotel cards from the\n"
+        "search_hotels artifact."
+    ),
+    version="1.0.0",
+    default_input_modes=["text/plain"],
+    default_output_modes=["text/plain"],
+    supported_interfaces=[
+        AgentInterface(
+            url=PUBLIC_URL,
+            protocol_binding=TransportProtocol.JSONRPC.value,
+            protocol_version="1.0",
+        ),
+    ],
+    capabilities=AgentCapabilities(streaming=False),
+    # Two atomic skills, mirroring flight-agent's shape.
+    skills=[
+        AgentSkill(
+            id="search_hotels",
+            name="Search hotels",
+            description=(
+                "Search-and-recommend mode. I return 12 hotel options for "
+                "ONE city + check-in/out window, ranked, with a recommended "
+                "pick and 2 backups."
+            ),
+            tags=["hotel", "search"],
+            examples=[
+                "Find me a hotel in Tokyo from 2026-10-15 to 2026-10-19 for 2 adults, under ₹15k per night",
+                "Search hotels in Paris from 2027-04-15 to 2027-04-22 for 2 adults, walking distance from the Louvre",
+            ],
+        ),
+        AgentSkill(
+            id="hold_hotel",
+            name="Hold a specific hotel",
+            description=(
+                "Hold mode. Place a 30-minute hold on a specific hotel the "
+                "user picked from a previous search recommendation. "
+                "Returns {hold_id, expires_at, price_total_inr}."
+            ),
+            tags=["hotel", "hold", "booking"],
+            examples=[
+                "Hold the Park Hyatt Shinjuku from 2026-10-15 to 2026-10-19",
+                "Hold the Hôtel Plaza Athénée you recommended from Apr 15 to Apr 22",
+            ],
+        ),
+    ],
 )
-_structured_llm = _llm.with_structured_output(HotelOptionsResponse)
 
 
-# ─── prompts ─────────────────────────────────────────────────────────────
+# ─── FastAPI app + A2A routes ────────────────────────────────────────────
 
-_SYSTEM = """You generate realistic hotel inventory for an Indian travel concierge.
-For ANY city + date range, produce 12 plausible hotel options that mix
-budget / mid-range / luxury across the city's distinct neighborhoods.
+executor = LangGraphA2AExecutor(_build_graph, agent_name="hotel-agent")
+handler = DefaultRequestHandler(
+    agent_executor=executor,
+    task_store=InMemoryTaskStore(),
+    agent_card=agent_card,
+)
 
-Pricing realism (per night, INR):
-  - Tokyo: ₹6k budget · ₹10-15k mid · ₹18-25k luxury
-  - Goa:   ₹4-7k budget · ₹8-14k mid · ₹15-30k luxury
-  - Bali:  ₹4-8k budget · ₹9-18k mid · ₹20-40k luxury
-  - European cities: ₹8-12k budget · ₹15-25k mid · ₹30-50k luxury
-  - Indian metros (Delhi/Mumbai/Bangalore): ₹4-7k · ₹8-15k · ₹18-35k
-  - Indian tier-2 (Jaipur/Udaipur/Kochi): ₹3-6k · ₹7-12k · ₹15-25k
+app = FastAPI(title="hotel-agent", version="1.0.0")
 
-Use real-sounding hotel names: international chains (Hyatt, Marriott, Taj,
-ITC, Oberoi, Hilton, Four Seasons, Ritz-Carlton, Park Hyatt, W, Aman) AND
-boutique/local picks. Spread across the city's actual neighborhoods.
-
-Amenities are short tags: pool, spa, beach, rooftop, gym, breakfast,
-view, central, design, onsen, ryokan, heritage, nightlife.
-
-Ratings: realistic for the price tier (budget ~3.5-4.0, mid ~4.0-4.5, luxury ~4.5-5.0).
-"""
+add_a2a_routes_to_fastapi(
+    app,
+    agent_card_routes=create_agent_card_routes(agent_card),
+    jsonrpc_routes=create_jsonrpc_routes(handler, rpc_url="/"),
+    rest_routes=create_rest_routes(handler),
+)
 
 
-def _user_prompt(city: str, check_in: str, check_out: str, pax: int, nights: int) -> str:
-    example = {
-        "hotel_id": "HTL-EXM-001",
-        "name": "Park Hyatt Example",
-        "city": city.title(),
-        "neighborhood": "Central",
-        "rating": 4.7,
-        "amenities": ["spa", "view", "pool"],
-        "per_night_inr": 18000,
-        "nights": nights,
-        "total_inr": 18000 * nights,
-        "pax": pax,
-    }
-    return f"""Generate 12 hotel options for:
-
-  city: {city}
-  check_in: {check_in}
-  check_out: {check_out}
-  pax: {pax}
-  nights: {nights}
-
-Mix budget / mid / luxury across the city's distinct neighborhoods. Use
-realistic names. Sort by rating descending.
-
-Reference example for ONE option (do not copy; use as calibration):
-
-{json.dumps(example, indent=2)}
-
-For each option:
-  - total_inr = per_night_inr × {nights}
-"""
-
-
-def _nights(check_in: str, check_out: str) -> int:
-    try:
-        ci = date.fromisoformat(check_in)
-        co = date.fromisoformat(check_out)
-        return max(1, (co - ci).days)
-    except ValueError:
-        return 1
-
-
-def _cache_key(city: str, check_in: str, check_out: str, pax: int) -> str:
-    base = f"{city.lower()}|{check_in}|{check_out}|{pax}"
-    h = hashlib.md5(base.encode()).hexdigest()[:12]
-    return f"hotel-options:{h}"
-
-
-async def _generate_options(city: str, check_in: str, check_out: str, pax: int) -> list[dict]:
-    nights = _nights(check_in, check_out)
-    response = await _structured_llm.ainvoke([
-        SystemMessage(content=_SYSTEM),
-        HumanMessage(content=_user_prompt(city, check_in, check_out, pax, nights)),
-    ])
-    return [o.model_dump() for o in response.options]
-
-
-# ─── HTTP ────────────────────────────────────────────────────────────────
+# ─── health probe for docker-compose ─────────────────────────────────────
 
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok", "service": "hotel-agent"}
-
-
-@a2a.skill("search_hotels")
-async def search_hotels(payload: dict) -> dict:
-    city = (payload.get("city") or "tokyo").strip()
-    check_in = payload.get("check_in") or "2026-10-15"
-    check_out = payload.get("check_out") or "2026-10-19"
-    pax = int(payload.get("pax", 2))
-    max_per_night_inr = payload.get("max_per_night_inr")
-
-    key = _cache_key(city, check_in, check_out, pax)
-
-    cached_raw = await _r.get(key)
-    if cached_raw:
-        log.info("hotel.cache.hit key=%s", key)
-        options = json.loads(cached_raw)
-    else:
-        log.info("hotel.cache.miss key=%s · structured LLM call", key)
-        try:
-            options = await _generate_options(city, check_in, check_out, pax)
-        except Exception as e:
-            log.exception("hotel.generate.failed")
-            return {
-                "options": [],
-                "recommended_id": None,
-                "recommended": None,
-                "error": f"could not generate hotel options: {e}",
-            }
-        await _r.setex(key, _CACHE_TTL_SECONDS, json.dumps(options))
-
-    candidates = options
-    if max_per_night_inr:
-        in_budget = [o for o in options if o.get("per_night_inr", 0) <= int(max_per_night_inr)]
-        candidates = in_budget if in_budget else options
-    if candidates:
-        recommended = max(candidates, key=lambda h: (h.get("rating", 0), -h.get("per_night_inr", 0)))
-    else:
-        recommended = None
-
-    return {
-        "options": options,
-        "recommended_id": recommended["hotel_id"] if recommended else None,
-        "recommended": recommended,
-    }
-
-
-@a2a.skill("hold_hotel")
-async def hold_hotel(payload: dict) -> dict:
-    expires = datetime.now(timezone.utc) + timedelta(minutes=30)
-    return {
-        "hold_id": f"HLD-{uuid.uuid4().hex[:8].upper()}",
-        "hotel_id": payload["hotel_id"],
-        "check_in": payload["check_in"],
-        "check_out": payload["check_out"],
-        "expires_at": expires.isoformat(),
-        "status": "held",
-    }

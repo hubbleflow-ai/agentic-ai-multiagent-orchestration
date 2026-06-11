@@ -20,7 +20,16 @@ export type AgentPhase =
   | "thinking"
   | "tool_calling"
   | "responding"
-  | "done";
+  | "done"
+  | "awaiting_approval";  // Phase 7 · paused at HITL capture_payment gate
+
+/** Phase 7 · Pending HITL approval. Non-null → render the approval modal. */
+export type PendingApproval = {
+  kind: "payment_approval";
+  authId: string | null;
+  amountInr: number | null;
+  status: "pending" | "approving" | "cancelling";
+};
 
 export type ToolCall = {
   id: string;
@@ -36,12 +45,14 @@ type AgentSliceState = {
   phase: AgentPhase;
   toolChain: ToolCall[];
   error: string | null;
+  pendingApproval: PendingApproval | null;
 };
 
 const initialState: AgentSliceState = {
   phase: "idle",
   toolChain: [],
   error: null,
+  pendingApproval: null,
 };
 
 const agentSlice = createSlice({
@@ -96,6 +107,18 @@ const agentSlice = createSlice({
       state.phase = "idle";
       state.toolChain = [];
       state.error = null;
+      // Don't clear pendingApproval here · resumes/cancels reuse the run
+      // and we want the modal to STAY until the user clicks Approve or
+      // Cancel. It clears via setPendingApproval(null) explicitly.
+    },
+
+    /** Phase 7 · stamp / clear the HITL pending-approval modal state. */
+    setPendingApproval(state, action: PayloadAction<PendingApproval | null>) {
+      state.pendingApproval = action.payload;
+    },
+    /** Phase 7 · convenience to flip status while resume/cancel in flight. */
+    setApprovalStatus(state, action: PayloadAction<PendingApproval["status"]>) {
+      if (state.pendingApproval) state.pendingApproval.status = action.payload;
     },
   },
 });
@@ -107,6 +130,8 @@ export const {
   clearLiveTools,
   setError,
   resetForNewRun,
+  setPendingApproval,
+  setApprovalStatus,
 } = agentSlice.actions;
 
 export const agentReducer = agentSlice.reducer;

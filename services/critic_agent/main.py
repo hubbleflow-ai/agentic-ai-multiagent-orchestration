@@ -1,67 +1,172 @@
-"""critic-agent · A2A worker for artifact review (Reflexion pattern).
+"""critic-agent · text-only A2A sub-agent for artifact review (Reflexion pattern).
 
-A2A skills:
-  - review_artifact(artifact_type, artifact, context?) →
-      {issues[], severity, suggestion}
+Phase 4 of the Session 6 refactor. No MCP tools · this is a pure LLM
+agent that takes an artifact (typically an itinerary JSON) and a brief
+context, and returns a critique: what's good, what's risky, concrete
+suggestions to revise.
 
-Phase 2A: rule-based reviewer that flags "too packed" days (≥4 items),
-overlapping times, missing meals. Phase 3 swaps in LLM-driven critique.
+Used by the supervisor's plan-then-critique loop:
+  1. itinerary-agent produces day-by-day plan
+  2. critic-agent reviews it
+  3. supervisor sends critique back to itinerary-agent for revision
+  4. supervisor surfaces the (possibly revised) plan to the user
+
+Endpoints (via add_a2a_routes_to_fastapi):
+  GET  /.well-known/agent-card.json
+  POST /                              · A2A JSON-RPC 2.0
+  GET  /health
 """
 
 from __future__ import annotations
 
+import logging
+import os
+
+from a2a.server.request_handlers import DefaultRequestHandler
+from a2a.server.routes import (
+    add_a2a_routes_to_fastapi,
+    create_agent_card_routes,
+    create_jsonrpc_routes,
+    create_rest_routes,
+)
+from a2a.server.tasks import InMemoryTaskStore
+from a2a.types import (
+    AgentCapabilities,
+    AgentCard,
+    AgentInterface,
+    AgentSkill,
+)
+from a2a.utils import TransportProtocol
 from fastapi import FastAPI
-from shared.a2a import A2AServer
+from langchain_core.messages import SystemMessage
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langgraph.graph import END, START, MessagesState, StateGraph
+
+from shared.agent_template import LangGraphA2AExecutor
 from shared.observability import setup_observability
 
 setup_observability("critic-agent")
+log = logging.getLogger(__name__)
 
-app = FastAPI(title="critic-agent", version="0.1.0")
-a2a = A2AServer(
+PUBLIC_URL = os.environ.get("CRITIC_AGENT_PUBLIC_URL", "http://critic-agent:8015/")
+
+
+_SYSTEM = """You are critic-agent · a sub-agent that reviews trip-planning
+artifacts for an Indian travel concierge. You operate on artifacts
+embedded in the brief (typically itineraries serialised as JSON, but
+also sometimes flight/hotel choices).
+
+Your job is to flag issues before the user sees the artifact. Be specific
+and actionable. Common failure modes to watch for:
+
+For itineraries:
+  - Day 1 is too packed (arrival/jet lag · keep it light, ≤3 items)
+  - Any day has >5 items (burnout risk)
+  - Tight transit windows between far-apart spots in the same day
+  - Missing meal slots (breakfast/lunch/dinner mostly accounted for?)
+  - Heritage / cultural sites on closure days (e.g. many Tokyo museums
+    closed on Mondays · Louvre closed Tuesdays)
+  - No buffer time around international flight arrival/departure days
+
+For flights:
+  - Connection time too short for international transit (<2h is risky)
+  - Overnight red-eye that wrecks day 1
+
+For hotels:
+  - Neighborhood mismatch with declared interests
+  - Distance from the day's planned activities
+
+## REPLY SHAPE
+ONE concise paragraph (4-7 sentences):
+  - Open with verdict: "Looks solid" OR "Two issues worth flagging" OR
+    "Major concern · suggest revising"
+  - State each issue in plain English with the specific day/leg/item
+  - End with ONE concrete suggested fix per issue · the supervisor will
+    pass your suggestions to itinerary-agent or flight-agent for revision.
+
+If everything is fine, say so plainly · don't manufacture issues. If
+you're flagging issues, be specific (which day, which item).
+
+Style: Indian English, no markdown bullet lists, no headings, no emojis.
+"""
+
+
+async def _build_graph():
+    llm = ChatGoogleGenerativeAI(
+        model=os.environ.get("GEMINI_MODEL", "gemini-3.5-flash"),
+        temperature=0.3,
+    )
+
+    async def model_node(state: MessagesState):
+        msgs = [SystemMessage(content=_SYSTEM), *state["messages"]]
+        response = await llm.ainvoke(msgs)
+        return {"messages": [response]}
+
+    graph = StateGraph(MessagesState)
+    graph.add_node("model", model_node)
+    graph.add_edge(START, "model")
+    graph.add_edge("model", END)
+    return graph.compile()
+
+
+agent_card = AgentCard(
+    # Top-level description is the EXACT text from the OLD
+    # delegate_to_critic_agent docstring in planner's tools.py.
+    name="critic-agent",
+    description=(
+        "Delegate artifact critique to the critic specialist (A2A).\n\n"
+        "Pass a brief embedding the artifact:\n"
+        '    "Review this 4-day Tokyo itinerary: {...}. Lands at 06:00 Day 1."\n\n'
+        "Returns {text, artifacts} · text is the critique paragraph; artifacts\n"
+        "empty. If issues are flagged, re-call delegate_to_itinerary_agent in\n"
+        "REVISE mode with the critique to apply fixes."
+    ),
+    version="1.0.0",
+    default_input_modes=["text/plain"],
+    default_output_modes=["text/plain"],
+    supported_interfaces=[
+        AgentInterface(
+            url=PUBLIC_URL,
+            protocol_binding=TransportProtocol.JSONRPC.value,
+            protocol_version="1.0",
+        ),
+    ],
+    capabilities=AgentCapabilities(streaming=False),
+    skills=[
+        AgentSkill(
+            id="review_artifact",
+            name="Review trip artifact",
+            description=(
+                "Critique an itinerary, flight choice, or hotel choice for "
+                "issues. Returns verdict + specific issues + suggested fixes."
+            ),
+            tags=["critic", "review", "reflexion"],
+            examples=[
+                'Review this 4-day Tokyo itinerary: {"days":[...]}. The user lands at 06:00 Day 1.',
+                'Review this hotel pick: {"hotel_id":"hyatt-shinjuku","price_per_night":18000} for a 4-day Tokyo stay, budget ₹60k.',
+                'Review this flight choice: {"flight_id":"JL754","dep_time":"23:55","arr_time":"06:00+1"}; user wanted a day flight.',
+            ],
+        )
+    ],
+)
+
+
+executor = LangGraphA2AExecutor(_build_graph, agent_name="critic-agent")
+handler = DefaultRequestHandler(
+    agent_executor=executor,
+    task_store=InMemoryTaskStore(),
+    agent_card=agent_card,
+)
+
+app = FastAPI(title="critic-agent", version="1.0.0")
+add_a2a_routes_to_fastapi(
     app,
-    agent_name="critic-agent",
-    description="Reviews trip artifacts (itineraries, plans) for issues.",
+    agent_card_routes=create_agent_card_routes(agent_card),
+    jsonrpc_routes=create_jsonrpc_routes(handler, rpc_url="/"),
+    rest_routes=create_rest_routes(handler),
 )
 
 
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok", "service": "critic-agent"}
-
-
-@a2a.skill("review_artifact")
-async def review_artifact(payload: dict) -> dict:
-    artifact_type = payload.get("artifact_type", "")
-    artifact = payload.get("artifact", {})
-    issues: list[dict] = []
-
-    if artifact_type == "itinerary":
-        days = artifact.get("days", [])
-        for d in days:
-            n = len(d.get("items", []))
-            if n >= 5:
-                issues.append({
-                    "day": d.get("day"),
-                    "issue": f"Day {d.get('day')} ({d.get('title','')}) has {n} items · risk of jet-lag burnout",
-                    "severity": "warning",
-                })
-        # Flag if first day has too much (jet lag)
-        if days and len(days[0].get("items", [])) >= 4:
-            issues.append({
-                "day": 1,
-                "issue": "Day 1 is the arrival day · keep it light to recover from the flight",
-                "severity": "warning",
-            })
-
-    severity = "ok" if not issues else max(i["severity"] for i in issues) if issues else "ok"
-    suggestion = ""
-    if any(i["severity"] == "warning" for i in issues):
-        suggestion = "tighten heavy days · remove the last item or two from any day with 5+ items"
-
-    return {
-        "artifact_type": artifact_type,
-        "issues": issues,
-        "severity": severity,
-        "suggestion": suggestion,
-        "approved": len(issues) == 0,
-    }

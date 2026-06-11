@@ -27,9 +27,17 @@ dependencies = [
     "langchain-google-genai>=2.0",
     "langgraph>=0.2",
 
-    # observability
+    # Multi-agent protocols (Session 6 refactor)
+    "a2a-sdk>=1.1.0",                   # Google's A2A protocol · agent-to-agent comms
+    "mcp>=1.27.2",                      # MCP server SDK · FastMCP for tool servers
+    "langchain-mcp-adapters>=0.2.2",    # MultiServerMCPClient · binds MCP tools as LangChain tools
+
+    # observability · Phase 8 cross-service tracing
     "arize-phoenix>=5.0",
+    "arize-phoenix-otel>=0.6",              # `register()` helper · wires OTLP HTTP exporter to Phoenix
     "openinference-instrumentation-langchain>=0.1",
+    "opentelemetry-instrumentation-fastapi>=0.48",   # inbound HTTP spans + traceparent extract
+    "opentelemetry-instrumentation-httpx>=0.48",     # outbound HTTP spans + traceparent inject
     "langsmith>=0.1",
 ]
 

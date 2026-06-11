@@ -58,45 +58,73 @@ services:
       PHOENIX_WORKING_DIR: /tmp/phoenix
     networks: [tripnet]
 
-  # ════════════════ tier 1 · mock external APIs ════════════════
-  mock-airline-api:
-    build:
-      context: .
-      dockerfile: docker/mock-api.Dockerfile
-      args: { API_NAME: airline }
-    ports: ["9001:9001"]
+  # ════════════════ tier 1 · MCP servers (typed tool surfaces) ════════════════
+  # Non-reasoning services that expose tools via MCP streamable-http.
+  # Consumed by A2A sub-agents (Phase 2+) and the Planner directly (Phase 3+).
+  mcp-airline:
+    <<: *agent-base
+    command: uvicorn services.mcp_servers.airline.main:app --host 0.0.0.0 --port 9011
+    ports: ["9011:9011"]
+    environment:
+      <<: *agent-env
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9001/health')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9011/health')"]
       interval: 5s
       timeout: 3s
       retries: 5
-    networks: [tripnet]
 
-  mock-hotel-api:
-    build:
-      context: .
-      dockerfile: docker/mock-api.Dockerfile
-      args: { API_NAME: hotel }
-    ports: ["9002:9002"]
+  mcp-hotel:
+    <<: *agent-base
+    command: uvicorn services.mcp_servers.hotel.main:app --host 0.0.0.0 --port 9012
+    ports: ["9012:9012"]
+    environment:
+      <<: *agent-env
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9002/health')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9012/health')"]
       interval: 5s
       timeout: 3s
       retries: 5
-    networks: [tripnet]
 
-  mock-payment-api:
-    build:
-      context: .
-      dockerfile: docker/mock-api.Dockerfile
-      args: { API_NAME: payment }
-    ports: ["9003:9003"]
+  mcp-trip-state:
+    <<: *agent-base
+    command: uvicorn services.mcp_servers.trip_state.main:app --host 0.0.0.0 --port 9015
+    ports: ["9015:9015"]
+    environment:
+      <<: *agent-env
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9003/health')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9015/health')"]
       interval: 5s
       timeout: 3s
       retries: 5
-    networks: [tripnet]
+
+  mcp-payment:
+    <<: *agent-base
+    command: uvicorn services.mcp_servers.payment.main:app --host 0.0.0.0 --port 9013
+    ports: ["9013:9013"]
+    environment:
+      <<: *agent-env
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9013/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  mcp-calendar:
+    <<: *agent-base
+    command: uvicorn services.mcp_servers.calendar.main:app --host 0.0.0.0 --port 9014
+    ports: ["9014:9014"]
+    environment:
+      <<: *agent-env
+      GOOGLE_TOKEN_PATH: /app/secrets/google-token.json
+      GOOGLE_CREDS_PATH: /app/secrets/google-creds.json
+    volumes:
+      - ./secrets/google-token.json:/app/secrets/google-token.json:ro
+      - ./secrets/google-creds.json:/app/secrets/google-creds.json:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9014/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
   # ════════════════ tier 2 · A2A worker agents ════════════════
   flight-agent:
@@ -105,11 +133,18 @@ services:
     ports: ["8010:8010"]
     environment:
       <<: *agent-env
-      AIRLINE_API_URL: http://mock-airline-api:9001
+      MCP_AIRLINE_URL: http://mcp-airline:9011/mcp
+      FLIGHT_AGENT_PUBLIC_URL: http://flight-agent:8010/
     depends_on:
       redis: { condition: service_healthy }
       phoenix: { condition: service_started }
-      mock-airline-api: { condition: service_healthy }
+      mcp-airline: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8010/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 30s
 
   hotel-agent:
     <<: *agent-base
@@ -117,11 +152,18 @@ services:
     ports: ["8011:8011"]
     environment:
       <<: *agent-env
-      HOTEL_API_URL: http://mock-hotel-api:9002
+      MCP_HOTEL_URL: http://mcp-hotel:9012/mcp
+      HOTEL_AGENT_PUBLIC_URL: http://hotel-agent:8011/
     depends_on:
       redis: { condition: service_healthy }
       phoenix: { condition: service_started }
-      mock-hotel-api: { condition: service_healthy }
+      mcp-hotel: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8011/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 30s
 
   itinerary-agent:
     <<: *agent-base
@@ -129,25 +171,18 @@ services:
     ports: ["8012:8012"]
     environment:
       <<: *agent-env
-
-  budget-agent:
-    <<: *agent-base
-    command: uvicorn services.budget_agent.main:app --host 0.0.0.0 --port 8013
-    ports: ["8013:8013"]
-    environment:
-      <<: *agent-env
-
-  payment-agent:
-    <<: *agent-base
-    command: uvicorn services.payment_agent.main:app --host 0.0.0.0 --port 8014
-    ports: ["8014:8014"]
-    environment:
-      <<: *agent-env
-      PAYMENT_API_URL: http://mock-payment-api:9003
+      MCP_TRIP_STATE_URL: http://mcp-trip-state:9015/mcp
+      ITINERARY_AGENT_PUBLIC_URL: http://itinerary-agent:8012/
     depends_on:
       redis: { condition: service_healthy }
       phoenix: { condition: service_started }
-      mock-payment-api: { condition: service_healthy }
+      mcp-trip-state: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8012/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 30s
 
   critic-agent:
     <<: *agent-base
@@ -155,27 +190,31 @@ services:
     ports: ["8015:8015"]
     environment:
       <<: *agent-env
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8015/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 30s
 
   todo-agent:
-    # Reuses Session 4's ToDoAgent code, A2A-wrapped.
     <<: *agent-base
     command: uvicorn services.todo_agent.main:app --host 0.0.0.0 --port 8016
     ports: ["8016:8016"]
     environment:
       <<: *agent-env
-
-  calendar-agent:
-    # Reuses Session 5's gcal MCP server, A2A-wrapped.
-    <<: *agent-base
-    command: uvicorn services.calendar_agent.main:app --host 0.0.0.0 --port 8017
-    ports: ["8017:8017"]
-    environment:
-      <<: *agent-env
-      GOOGLE_TOKEN_PATH: /app/secrets/google-token.json
-      GOOGLE_CREDS_PATH: /app/secrets/google-creds.json
-    volumes:
-      - ./secrets/google-token.json:/app/secrets/google-token.json:ro
-      - ./secrets/google-creds.json:/app/secrets/google-creds.json:ro
+      MCP_TRIP_STATE_URL: http://mcp-trip-state:9015/mcp
+      TODO_AGENT_PUBLIC_URL: http://todo-agent:8016/
+    depends_on:
+      redis: { condition: service_healthy }
+      phoenix: { condition: service_started }
+      mcp-trip-state: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8016/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 30s
 
   research-agent:
     <<: *agent-base
@@ -183,6 +222,12 @@ services:
     ports: ["8018:8018"]
     environment:
       <<: *agent-env
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8018/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 30s
 
   # ════════════════ tier 3 · planner (supervisor) ════════════════
   planner:
@@ -191,28 +236,43 @@ services:
     ports: ["8001:8001"]
     environment:
       <<: *agent-env
-      # A2A peer registry — Planner discovers workers via these URLs
-      FLIGHT_AGENT_URL:    http://flight-agent:8010
-      HOTEL_AGENT_URL:     http://hotel-agent:8011
-      ITINERARY_AGENT_URL: http://itinerary-agent:8012
-      BUDGET_AGENT_URL:    http://budget-agent:8013
-      PAYMENT_AGENT_URL:   http://payment-agent:8014
-      CRITIC_AGENT_URL:    http://critic-agent:8015
-      TODO_AGENT_URL:      http://todo-agent:8016
-      CALENDAR_AGENT_URL:  http://calendar-agent:8017
-      RESEARCH_AGENT_URL:  http://research-agent:8018
+      # A2A sub-agents · each speaks the a2a-sdk protocol with Agent Card
+      # at /.well-known/agent-card.json. Planner reaches them via the
+      # delegate_to_<agent>_agent @tools (see shared/a2a_helpers/client.py).
+      FLIGHT_AGENT_A2A_URL:    http://flight-agent:8010/
+      HOTEL_AGENT_A2A_URL:     http://hotel-agent:8011/
+      RESEARCH_AGENT_A2A_URL:  http://research-agent:8018/
+      CRITIC_AGENT_A2A_URL:    http://critic-agent:8015/
+      ITINERARY_AGENT_A2A_URL: http://itinerary-agent:8012/
+      TODO_AGENT_A2A_URL:      http://todo-agent:8016/
+      # MCP servers · the Planner calls these DIRECTLY (no agent layer ·
+      # deterministic non-reasoning operations: budget, payment, calendar).
+      # See planner's _ensure_mcp_tools() / _call_mcp() in main.py.
+      MCP_TRIP_STATE_URL:      http://mcp-trip-state:9015/mcp
+      MCP_PAYMENT_URL:         http://mcp-payment:9013/mcp
+      MCP_CALENDAR_URL:        http://mcp-calendar:9014/mcp
+    # ALL deps wait for service_healthy now · the planner imports
+    # dynamic_a2a_tools at startup which fetches flight-agent's Agent
+    # Card synchronously. The card endpoint must be live before the
+    # planner process starts or import crashes.
     depends_on:
       redis:            { condition: service_healthy }
       phoenix:          { condition: service_started }
-      flight-agent:     { condition: service_started }
-      hotel-agent:      { condition: service_started }
-      itinerary-agent:  { condition: service_started }
-      budget-agent:     { condition: service_started }
-      payment-agent:    { condition: service_started }
-      critic-agent:     { condition: service_started }
-      todo-agent:       { condition: service_started }
-      calendar-agent:   { condition: service_started }
-      research-agent:   { condition: service_started }
+      flight-agent:     { condition: service_healthy }
+      hotel-agent:      { condition: service_healthy }
+      itinerary-agent:  { condition: service_healthy }
+      critic-agent:     { condition: service_healthy }
+      todo-agent:       { condition: service_healthy }
+      research-agent:   { condition: service_healthy }
+      mcp-trip-state:   { condition: service_healthy }
+      mcp-payment:      { condition: service_healthy }
+      mcp-calendar:     { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 45s
 
   # ════════════════ tier 4 · voice front-end ════════════════
   concierge-voice:

@@ -1,0 +1,14 @@
+{
+  "jsonrpc": "2.0",
+  "id": "test-1",
+  "method": "SendMessage",
+  "params": {
+    "message": {
+      "messageId": "msg-test-1",
+      "role": "ROLE_USER",
+      "parts": [
+        {"text": "Find me a non-stop flight from BLR to NRT on 2026-10-15 for 2 adults under 150000 INR total."}
+      ]
+    }
+  }
+}
