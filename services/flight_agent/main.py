@@ -183,12 +183,25 @@ async def _build_graph():
 # ─── A2A Agent Card ──────────────────────────────────────────────────────
 
 agent_card = AgentCard(
+    # Top-level description is the EXACT text that used to be the
+    # planner's hand-written delegate_to_flight_agent docstring · moved
+    # here so the planner now DISCOVERS this guidance from the card
+    # instead of hardcoding it. Do not add agent-internal implementation
+    # details (e.g. "mcp-airline") here · the supervisor doesn't need
+    # to know which MCP the agent uses internally.
     name="flight-agent",
     description=(
-        "Flight discovery and booking-hold specialist. Given a natural-language "
-        "brief (e.g. 'BLR to NRT, Oct 15, 2 adults, prefer non-stop, under ₹1.5L'), "
-        "searches 12 realistic options via mcp-airline, recommends one with "
-        "reasoning, and can place a 30-min hold on confirm."
+        "Delegate a flight-related task to the flight specialist sub-agent (A2A).\n\n"
+        "Returns a JSON object (encoded as string) with two top-level fields:\n\n"
+        '  "text"      · the sub-agent\'s natural-language reply (recommendation\n'
+        "                + backups, or hold confirmation). PARAPHRASE this for\n"
+        "                the user; do NOT enumerate option lists or prices.\n\n"
+        '  "artifacts" · structured outputs · UI renders flight cards from these.\n\n'
+        "Pattern of use:\n"
+        "    1. First call: search-and-recommend brief\n"
+        "    2. Surface the recommendation, wait for user pick\n"
+        "    3. Second call: hold brief\n"
+        "    4. Then check_budget + commit_spend"
     ),
     version="1.0.0",
     default_input_modes=["text/plain"],
@@ -201,21 +214,38 @@ agent_card = AgentCard(
         ),
     ],
     capabilities=AgentCapabilities(streaming=False),
+    # Two atomic skills, each with its OWN example briefs. The planner's
+    # dynamic_a2a_tools.py concatenates these (skill description +
+    # examples list) onto the top-level description above to form the
+    # full tool docstring the LLM sees.
     skills=[
         AgentSkill(
-            id="search_and_recommend_flight",
-            name="Search & recommend flight",
+            id="search_flights",
+            name="Search flights",
             description=(
-                "Search 12 flight options for a route + dates, recommend one "
-                "with reasoning, and place a 30-min hold if asked."
+                "Search-and-recommend mode. I return 12 flight options for "
+                "ONE route + date, ranked, with a recommended pick and 2 backups."
             ),
-            tags=["flight", "travel", "booking", "search"],
+            tags=["flight", "search"],
             examples=[
-                "Find me a non-stop flight from BLR to NRT on 2026-10-15 "
-                "for 2 adults under ₹1.5L total.",
-                "Hold the Air India non-stop from your last recommendation.",
+                "Search BLR to NRT on 2026-10-15 for 2 adults, prefer non-stop, under ₹1.5L per leg",
+                "Find a non-stop BLR to CDG flight on 2027-04-15 for 2 adults under ₹1L per leg",
             ],
-        )
+        ),
+        AgentSkill(
+            id="hold_flight",
+            name="Hold a specific flight",
+            description=(
+                "Hold mode. Place a 30-minute hold on a specific flight the "
+                "user picked from a previous search recommendation. "
+                "Returns {hold_id, expires_at, price_total_inr}."
+            ),
+            tags=["flight", "hold", "booking"],
+            examples=[
+                "Hold the JAL JL754 you recommended for 2 adults",
+                "Hold the Air India AI314 non-stop from your last recommendation",
+            ],
+        ),
     ],
 )
 

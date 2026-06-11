@@ -99,11 +99,19 @@ async def _build_graph():
 
 
 agent_card = AgentCard(
+    # Top-level description is the EXACT text from the OLD
+    # delegate_to_research_agent docstring in planner's tools.py.
     name="research-agent",
     description=(
-        "Destination research specialist for an Indian travel concierge. "
-        "Given a city + dates + interests, returns visa info, best months, "
-        "neighborhoods, must-see spots, and gotchas in one concise briefing."
+        "Delegate destination research to the research specialist (A2A).\n\n"
+        "The research-agent is a text-only LLM sub-agent. Pass it a brief like\n"
+        '"Tell me about Tokyo for an Indian traveller in October" and it returns\n'
+        "one paragraph covering visa, weather, neighborhoods, must-see, gotchas.\n\n"
+        "Returns a JSON object {text, artifacts} · text is the briefing; the\n"
+        "artifacts list will be empty (research-agent doesn't emit cards).\n"
+        "Use the text to anchor your subsequent flight/hotel recommendations\n"
+        "but DO NOT regurgitate the whole paragraph back to the user verbatim ·\n"
+        "extract the 1-2 most relevant points for the current decision."
     ),
     version="1.0.0",
     default_input_modes=["text/plain"],
@@ -121,13 +129,14 @@ agent_card = AgentCard(
             id="research_destination",
             name="Research destination",
             description=(
-                "Brief the supervisor on a destination: visa, weather, "
-                "neighborhoods, must-see, gotchas · one concise paragraph."
+                "Return a concise paragraph covering visa, weather, "
+                "neighborhoods, must-see, and gotchas for a destination."
             ),
             tags=["research", "travel", "destination"],
             examples=[
                 "Tell me about Tokyo for an Indian traveller visiting in October.",
                 "What should we know about Bali for a 7-day trip in December?",
+                "Research Sydney + Melbourne for a 15-day Australia trip in November.",
             ],
         )
     ],

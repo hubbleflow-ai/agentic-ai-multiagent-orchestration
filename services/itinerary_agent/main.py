@@ -141,10 +141,15 @@ async def _build_graph():
 
 
 agent_card = AgentCard(
+    # Top-level description is the EXACT text from the OLD
+    # delegate_to_itinerary_agent docstring in planner's tools.py.
     name="itinerary-agent",
     description=(
-        "Day-by-day itinerary specialist. Builds a structured plan via "
-        "mcp-trip-state.build_itinerary or revises one based on critic feedback."
+        "Delegate itinerary build/revise to the itinerary specialist (A2A).\n\n"
+        'For BUILD pass: "Build a 4-day Tokyo itinerary, foodie interests".\n'
+        'For REVISE pass: "Revise this itinerary: {<JSON>} CRITIQUE: <text>".\n\n'
+        "Returns {text, artifacts}; UI renders day cards from the artifact.\n"
+        "Reply in ONE sentence · don't enumerate days in your text."
     ),
     version="1.0.0",
     default_input_modes=["text/plain"],
@@ -157,20 +162,34 @@ agent_card = AgentCard(
         ),
     ],
     capabilities=AgentCapabilities(streaming=False),
+    # Two atomic skills, mirroring the two underlying MCP operations.
     skills=[
         AgentSkill(
-            id="build_or_revise_itinerary",
-            name="Build or revise itinerary",
+            id="build_itinerary",
+            name="Build a fresh itinerary",
             description=(
-                "Build a fresh day-by-day plan or revise an existing one "
-                "based on critic feedback."
+                "Build mode. Produce a structured day-by-day plan for ONE "
+                "city, given interests + duration + hotel neighborhood."
             ),
-            tags=["itinerary", "travel", "planning"],
+            tags=["itinerary", "build", "planning"],
             examples=[
-                "Build a 4-day Tokyo itinerary for a foodie traveller, hotel in Shinjuku.",
-                "Revise this itinerary based on critic feedback: {...}",
+                "Build a 4-day Tokyo itinerary for a foodie traveller, hotel in Shinjuku",
+                "Build a 3-day Paris itinerary, art focus, hotel near the Louvre",
             ],
-        )
+        ),
+        AgentSkill(
+            id="revise_itinerary",
+            name="Revise an existing itinerary",
+            description=(
+                "Revise mode. Apply critique to an existing itinerary JSON "
+                "and return the updated plan."
+            ),
+            tags=["itinerary", "revise", "planning"],
+            examples=[
+                'Revise this itinerary: {"days":[...]} CRITIQUE: Day 1 is too packed after a 06:00 landing',
+                'Revise this itinerary: {"days":[...]} CRITIQUE: Day 3 has two museums back-to-back · split them',
+            ],
+        ),
     ],
 )
 

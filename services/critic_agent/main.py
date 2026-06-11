@@ -110,11 +110,16 @@ async def _build_graph():
 
 
 agent_card = AgentCard(
+    # Top-level description is the EXACT text from the OLD
+    # delegate_to_critic_agent docstring in planner's tools.py.
     name="critic-agent",
     description=(
-        "Reflexion-style critic. Reviews trip artifacts (typically itineraries) "
-        "for risks before the user sees them. Returns a concise verdict + "
-        "specific issues + concrete suggested fixes."
+        "Delegate artifact critique to the critic specialist (A2A).\n\n"
+        "Pass a brief embedding the artifact:\n"
+        '    "Review this 4-day Tokyo itinerary: {...}. Lands at 06:00 Day 1."\n\n'
+        "Returns {text, artifacts} · text is the critique paragraph; artifacts\n"
+        "empty. If issues are flagged, re-call delegate_to_itinerary_agent in\n"
+        "REVISE mode with the critique to apply fixes."
     ),
     version="1.0.0",
     default_input_modes=["text/plain"],
@@ -132,12 +137,14 @@ agent_card = AgentCard(
             id="review_artifact",
             name="Review trip artifact",
             description=(
-                "Critique an itinerary / flight choice / hotel choice for "
+                "Critique an itinerary, flight choice, or hotel choice for "
                 "issues. Returns verdict + specific issues + suggested fixes."
             ),
             tags=["critic", "review", "reflexion"],
             examples=[
-                "Review this 4-day Tokyo itinerary: {\"days\":[...]}. The user lands at 06:00 Day 1.",
+                'Review this 4-day Tokyo itinerary: {"days":[...]}. The user lands at 06:00 Day 1.',
+                'Review this hotel pick: {"hotel_id":"hyatt-shinjuku","price_per_night":18000} for a 4-day Tokyo stay, budget ₹60k.',
+                'Review this flight choice: {"flight_id":"JL754","dep_time":"23:55","arr_time":"06:00+1"}; user wanted a day flight.',
             ],
         )
     ],

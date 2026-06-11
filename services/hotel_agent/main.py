@@ -165,12 +165,14 @@ async def _build_graph():
 # ─── A2A Agent Card ──────────────────────────────────────────────────────
 
 agent_card = AgentCard(
+    # Top-level description is the EXACT text from the OLD
+    # delegate_to_hotel_agent docstring in planner's tools.py.
     name="hotel-agent",
     description=(
-        "Hotel discovery and booking-hold specialist. Given a natural-language "
-        "brief (e.g. 'Find a hotel in Tokyo from Oct 15 to Oct 19 for 2 adults, "
-        "under ₹15k per night'), searches 12 realistic options via mcp-hotel, "
-        "recommends one with reasoning, and can place a 30-min hold on confirm."
+        "Delegate a hotel-related task to the hotel specialist sub-agent (A2A).\n\n"
+        "Same pattern as delegate_to_flight_agent. ONE city stay per call ·\n"
+        "NEVER bundle multiple stays. UI renders hotel cards from the\n"
+        "search_hotels artifact."
     ),
     version="1.0.0",
     default_input_modes=["text/plain"],
@@ -183,21 +185,36 @@ agent_card = AgentCard(
         ),
     ],
     capabilities=AgentCapabilities(streaming=False),
+    # Two atomic skills, mirroring flight-agent's shape.
     skills=[
         AgentSkill(
-            id="search_and_recommend_hotel",
-            name="Search & recommend hotel",
+            id="search_hotels",
+            name="Search hotels",
             description=(
-                "Search 12 hotel options for a city + check-in/out dates, "
-                "recommend one with reasoning, and place a 30-min hold if asked."
+                "Search-and-recommend mode. I return 12 hotel options for "
+                "ONE city + check-in/out window, ranked, with a recommended "
+                "pick and 2 backups."
             ),
-            tags=["hotel", "travel", "booking", "search"],
+            tags=["hotel", "search"],
             examples=[
-                "Find me a hotel in Tokyo from 2026-10-15 to 2026-10-19 "
-                "for 2 adults, under ₹15k per night.",
-                "Hold the Park Hyatt Shinjuku from Oct 15 to Oct 19.",
+                "Find me a hotel in Tokyo from 2026-10-15 to 2026-10-19 for 2 adults, under ₹15k per night",
+                "Search hotels in Paris from 2027-04-15 to 2027-04-22 for 2 adults, walking distance from the Louvre",
             ],
-        )
+        ),
+        AgentSkill(
+            id="hold_hotel",
+            name="Hold a specific hotel",
+            description=(
+                "Hold mode. Place a 30-minute hold on a specific hotel the "
+                "user picked from a previous search recommendation. "
+                "Returns {hold_id, expires_at, price_total_inr}."
+            ),
+            tags=["hotel", "hold", "booking"],
+            examples=[
+                "Hold the Park Hyatt Shinjuku from 2026-10-15 to 2026-10-19",
+                "Hold the Hôtel Plaza Athénée you recommended from Apr 15 to Apr 22",
+            ],
+        ),
     ],
 )
 

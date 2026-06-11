@@ -33,9 +33,8 @@ from langchain_core.messages import HumanMessage, ToolMessage
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
-from services.planner.graph import CAPTURE_NODE, agent, checkpointer
+from services.planner.graph import CAPTURE_NODE, TOOLS, agent, checkpointer
 from services.planner.sse import stream_agent_events
-from services.planner.tools import TOOLS
 from shared.observability import setup_observability
 
 setup_observability("planner")

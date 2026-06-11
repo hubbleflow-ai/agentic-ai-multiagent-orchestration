@@ -139,6 +139,12 @@ services:
       redis: { condition: service_healthy }
       phoenix: { condition: service_started }
       mcp-airline: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8010/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 30s
 
   hotel-agent:
     <<: *agent-base
@@ -152,6 +158,12 @@ services:
       redis: { condition: service_healthy }
       phoenix: { condition: service_started }
       mcp-hotel: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8011/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 30s
 
   itinerary-agent:
     <<: *agent-base
@@ -165,6 +177,12 @@ services:
       redis: { condition: service_healthy }
       phoenix: { condition: service_started }
       mcp-trip-state: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8012/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 30s
 
   critic-agent:
     <<: *agent-base
@@ -172,6 +190,12 @@ services:
     ports: ["8015:8015"]
     environment:
       <<: *agent-env
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8015/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 30s
 
   todo-agent:
     <<: *agent-base
@@ -185,6 +209,12 @@ services:
       redis: { condition: service_healthy }
       phoenix: { condition: service_started }
       mcp-trip-state: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8016/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 30s
 
   research-agent:
     <<: *agent-base
@@ -192,6 +222,12 @@ services:
     ports: ["8018:8018"]
     environment:
       <<: *agent-env
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8018/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 30s
 
   # ════════════════ tier 3 · planner (supervisor) ════════════════
   planner:
@@ -215,18 +251,28 @@ services:
       MCP_TRIP_STATE_URL:      http://mcp-trip-state:9015/mcp
       MCP_PAYMENT_URL:         http://mcp-payment:9013/mcp
       MCP_CALENDAR_URL:        http://mcp-calendar:9014/mcp
+    # ALL deps wait for service_healthy now · the planner imports
+    # dynamic_a2a_tools at startup which fetches flight-agent's Agent
+    # Card synchronously. The card endpoint must be live before the
+    # planner process starts or import crashes.
     depends_on:
       redis:            { condition: service_healthy }
       phoenix:          { condition: service_started }
-      flight-agent:     { condition: service_started }
-      hotel-agent:      { condition: service_started }
-      itinerary-agent:  { condition: service_started }
-      critic-agent:     { condition: service_started }
-      todo-agent:       { condition: service_started }
-      research-agent:   { condition: service_started }
+      flight-agent:     { condition: service_healthy }
+      hotel-agent:      { condition: service_healthy }
+      itinerary-agent:  { condition: service_healthy }
+      critic-agent:     { condition: service_healthy }
+      todo-agent:       { condition: service_healthy }
+      research-agent:   { condition: service_healthy }
       mcp-trip-state:   { condition: service_healthy }
       mcp-payment:      { condition: service_healthy }
       mcp-calendar:     { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 45s
 
   # ════════════════ tier 4 · voice front-end ════════════════
   concierge-voice:

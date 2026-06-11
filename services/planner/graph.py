@@ -40,8 +40,26 @@ from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
 
 from services.planner.config import GEMINI_MODEL, GEMINI_THINKING_LEGACY, GEMINI_THINKING_LEVEL
+from services.planner.dynamic_a2a_tools import build_all_a2a_tools
 from services.planner.prompt import SYSTEM_PROMPT
-from services.planner.tools import TOOLS
+from services.planner.tools import PLANNER_TOOL_NAMES, STATIC_TOOLS
+
+# ─── tool catalogue · 6 static MCP-backed + 6 dynamic A2A = 12 total ─────
+# All 6 delegate_to_<agent> tools are BUILT at startup from each sub-
+# agent's Agent Card. See dynamic_a2a_tools.py. The planner has ZERO
+# hand-written knowledge of any sub-agent's capabilities · everything
+# comes from cards. Docker `depends_on: service_healthy` on every sub-
+# agent guarantees the cards are reachable by the time this import runs.
+
+_a2a_tools = build_all_a2a_tools()
+TOOLS = STATIC_TOOLS + _a2a_tools
+
+# Keep the SSE producer's outer-tool filter in sync with what we actually
+# expose to the LLM · without this the dynamic A2A tools' events would
+# be suppressed (their names aren't in PLANNER_TOOL_NAMES at import time
+# of tools.py · they're only known after build_all_a2a_tools runs).
+for _t in _a2a_tools:
+    PLANNER_TOOL_NAMES.add(_t.name)
 
 log = logging.getLogger(__name__)
 

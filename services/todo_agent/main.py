@@ -116,11 +116,14 @@ async def _build_graph():
 
 
 agent_card = AgentCard(
+    # Top-level description is the EXACT text from the OLD
+    # delegate_to_todo_agent docstring in planner's tools.py.
     name="todo-agent",
     description=(
-        "Pre-trip todo specialist. Generates the standard prep checklist "
-        "(passport, visa, insurance, bank, forex, packing, check-in) with "
-        "due dates anchored to departure."
+        "Delegate pre-trip todo generation to the todo specialist (A2A).\n\n"
+        'Brief shape: "Create pre-trip todos for Tokyo with departure on 2026-10-15".\n\n'
+        "Returns {text, artifacts} · UI renders the todos panel from the\n"
+        "create_todos artifact. Don't enumerate todos in your text."
     ),
     version="1.0.0",
     default_input_modes=["text/plain"],
@@ -138,12 +141,14 @@ agent_card = AgentCard(
             id="create_pretrip_todos",
             name="Create pre-trip todos",
             description=(
-                "Generate a standard pre-trip checklist with due dates "
+                "Generate the standard pre-trip checklist (passport, visa, "
+                "insurance, bank, forex, packing, check-in) with due dates "
                 "anchored to the departure date."
             ),
             tags=["todo", "travel", "planning"],
             examples=[
-                "Create pre-trip todos for Tokyo with departure on 2026-10-15.",
+                "Create pre-trip todos for Tokyo with departure on 2026-10-15",
+                "Create pre-trip todos for Paris with departure on 2027-04-15 for 2 adults",
             ],
         )
     ],

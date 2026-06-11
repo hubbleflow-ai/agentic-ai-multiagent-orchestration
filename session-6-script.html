@@ -1452,6 +1452,545 @@
     decisions live in HOW the patterns compose, not in any one of them alone.
   </div>
 
+  <!-- ─────────────── Implementation deep dive header ─────────────── -->
+
+  <h2 style="margin-top: 56px;">Implementation deep dive · cohort walkthrough</h2>
+
+  <p>
+    The patterns above are the conceptual map. The four sections below
+    are the live code walkthrough notes · how the supervisor actually
+    discovers its sub-agents, how the LangGraph is shaped, how HITL
+    really works under the hood, and how an A2A call travels the wire.
+    Each one is a self-contained micro-talk.
+  </p>
+
+  <!-- ─────────────── 1 · Dynamic A2A discovery ─────────────── -->
+
+  <h3 style="margin-top: 32px;">1 · Dynamic A2A discovery · how the planner builds its tool catalogue</h3>
+
+  <p>
+    The first version of the planner had a 200-line <code class="inline">tools.py</code>
+    with hand-written <code class="inline">delegate_to_<agent></code> @tool
+    functions for each sub-agent. The docstrings on those tools described
+    each agent's capabilities. <strong>That was the opposite of what
+    A2A is supposed to enable</strong> · the supervisor was hardcoding
+    knowledge that should have been discovered from each agent's
+    <code class="inline">/.well-known/agent-card.json</code>.
+  </p>
+
+  <p>
+    We closed that gap. Now at planner startup, the supervisor fetches
+    each sub-agent's Agent Card, concatenates the card's
+    <code class="inline">description</code> + every skill's
+    <code class="inline">description</code> + every skill's
+    <code class="inline">examples</code> into one rich docstring, and
+    wraps that as a LangChain <code class="inline">StructuredTool</code>.
+    The LLM sees descriptions sourced FROM the agents themselves,
+    not from any planner source file.
+  </p>
+
+  <h4 style="margin-top: 20px; font-size: 14px;">The flow in 4 steps</h4>
+
+<pre class="diagram">
+At planner startup (services/planner/graph.py imports
+services/planner/dynamic_a2a_tools.py):
+
+  ┌────────────────────────────────────────────────────────────────┐
+  │  for each (agent_name, agent_url) in A2A_SUBAGENTS:            │
+  │                                                                │
+  │    1. card = httpx.get(agent_url + "/.well-known/agent-card.json")
+  │       └─ retried 8× with 1.5s backoff                          │
+  │                                                                │
+  │    2. description = card.description + each skill's            │
+  │       description + each skill's examples (concatenated)       │
+  │                                                                │
+  │    3. tool = StructuredTool.from_function(                     │
+  │         coroutine=async delegate(brief):                       │
+  │             return await delegate_to_a2a_agent(url, brief),    │
+  │         name=f"delegate_to_{agent_name}",                      │
+  │         description=description,    ◀── from the card          │
+  │       )                                                        │
+  │                                                                │
+  │    4. tools.append(tool)                                       │
+  │                                                                │
+  │  TOOLS = STATIC_TOOLS + tools                                  │
+  │  _llm_with_tools = _llm.bind_tools(TOOLS)                      │
+  └────────────────────────────────────────────────────────────────┘
+</pre>
+
+  <h4 style="margin-top: 20px; font-size: 14px;">What moved where</h4>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Knowledge type</th>
+        <th>Before</th>
+        <th>After</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>"What this agent does" prose</td>
+        <td>Hardcoded in planner's tools.py docstring</td>
+        <td>Lives in agent's own <code class="inline">card.description</code></td>
+      </tr>
+      <tr>
+        <td>Brief format examples</td>
+        <td>Nowhere · scattered across system prompt</td>
+        <td>Each <code class="inline">AgentSkill</code> has its own <code class="inline">examples</code> list</td>
+      </tr>
+      <tr>
+        <td>Atomic capabilities</td>
+        <td>Collapsed (1 stuffed delegate per agent)</td>
+        <td>1-2 atomic skills per agent (search + hold for flight/hotel; build + revise for itinerary)</td>
+      </tr>
+      <tr>
+        <td>Adding a new sub-agent</td>
+        <td>Write @tool wrapper + docstring + edit prompt</td>
+        <td>Add one entry to <code class="inline">A2A_SUBAGENTS</code> dict</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h4 style="margin-top: 20px; font-size: 14px;">What still belongs to the planner (correctly)</h4>
+
+  <ul>
+    <li><strong>Cross-agent workflow ordering</strong> (search → hold → check_budget → commit_spend → ...) lives in <code class="inline">prompt.py</code> · cannot live on any single agent's card.</li>
+    <li><strong>Agent URL registry</strong> (<code class="inline">A2A_SUBAGENTS</code> dict in <code class="inline">dynamic_a2a_tools.py</code>) · the planner has to know which agents exist. Pure config.</li>
+    <li><strong>HITL gate</strong> (<code class="inline">interrupt_before=[CAPTURE_NODE]</code> in <code class="inline">graph.py</code>) · runtime safety, not capability description.</li>
+    <li><strong>6 MCP-backed tools</strong> in <code class="inline">tools.py</code> (set_budget, authorize_payment, etc.) · these inject the <code class="inline">trip_id</code> ContextVar that the LLM should never see.</li>
+  </ul>
+
+  <div class="callout">
+    <strong>The cohort demo move:</strong> edit any sub-agent's
+    <code class="inline">card.description</code>, restart that agent,
+    restart the planner. The planner's tool catalogue now contains the
+    edit · without touching a single line of planner source code. That's
+    the moment students get what dynamic discovery actually means.
+  </div>
+
+  <!-- ─────────────── 2 · Graph nodes ─────────────── -->
+
+  <h3 style="margin-top: 36px;">2 · The planner's graph · 3 nodes plus the START/END sentinels</h3>
+
+  <p>
+    The supervisor is a LangGraph <code class="inline">StateGraph(MessagesState)</code>
+    with exactly three nodes. Everything else (HITL, tool routing, the
+    capture gate) emerges from how these three are wired together.
+  </p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Node</th>
+        <th>Type</th>
+        <th>What it does</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code class="inline">model</code></td>
+        <td>function</td>
+        <td>Calls Gemini with the system prompt + message history. Decides what to do next (respond, call tools, finish). The thinking node.</td>
+      </tr>
+      <tr>
+        <td><code class="inline">regular_tools</code></td>
+        <td><code class="inline">ToolNode</code></td>
+        <td>Holds 11 of the 12 tools (all except <code class="inline">capture_payment</code>). Executes whichever tools the model's last AIMessage asked for and returns the results as ToolMessages.</td>
+      </tr>
+      <tr>
+        <td><code class="inline">capture_payment</code></td>
+        <td><code class="inline">ToolNode</code></td>
+        <td>Holds ONLY <code class="inline">capture_payment</code>. Split out so <code class="inline">interrupt_before</code> can pause the graph BEFORE this node runs · the HITL gate.</td>
+      </tr>
+    </tbody>
+  </table>
+
+<pre class="diagram">
+       START ─▶ model ─▶ (route_after_model)
+                            │
+                            ├─▶ regular_tools ──┐
+                            ├─▶ capture_payment ┤   (interrupt_before=["capture_payment"])
+                            └─▶ END             │
+                            ▲                   │
+                            └───────────────────┘
+</pre>
+
+  <h4 style="margin-top: 16px; font-size: 14px;">The router · <code class="inline">_route_after_model</code></h4>
+
+<pre class="diagram">
+def _route_after_model(state) -> str:
+    last = state["messages"][-1]
+    tool_calls = getattr(last, "tool_calls", None) or []
+    if not tool_calls:
+        return END                              # model is done talking
+    if any(tc.get("name") == CAPTURE_NODE for tc in tool_calls):
+        return CAPTURE_NODE                     # → pause (HITL)
+    return REGULAR_NODE                         # → run normally
+</pre>
+
+  <p>
+    After either tool node runs, control loops back to <code class="inline">model</code>
+    so the LLM can react to the tool results. This is the standard
+    ReAct loop · the only twist is the dedicated capture node for HITL.
+  </p>
+
+  <div class="callout">
+    <strong>Why split <code class="inline">capture_payment</code> into its own node:</strong>
+    without the split, every tool call would pause (because
+    <code class="inline">interrupt_before</code> applies to a whole
+    node). Putting <code class="inline">capture_payment</code> in its
+    own node means only THAT tool triggers the pause · all the searches,
+    holds, budget checks, and calendar drops run smoothly.
+  </div>
+
+  <!-- ─────────────── 3 · HITL mechanics ─────────────── -->
+
+  <h3 style="margin-top: 36px;">3 · How HITL actually works · 3 LangGraph primitives composed</h3>
+
+  <p>
+    HITL is not bolted on as a special case. It's built from three
+    primitives LangGraph gives you, composed together. Each primitive
+    is small; the composition is what produces the user-visible
+    "modal pops up, user clicks Approve, graph resumes" experience.
+  </p>
+
+  <h4 style="margin-top: 20px; font-size: 14px;">Primitive 1 · <code class="inline">interrupt_before</code> at compile time</h4>
+
+<pre class="diagram">
+agent = _graph.compile(
+    checkpointer=checkpointer,           # MemorySaver()
+    interrupt_before=[CAPTURE_NODE],     # "capture_payment"
+)
+</pre>
+
+  <p>
+    Tells LangGraph: "Before executing <code class="inline">capture_payment</code>,
+    FREEZE. Save current state to the checkpointer. Stop streaming
+    events. Don't run the node." This is the SELECTIVE pause.
+  </p>
+
+  <h4 style="margin-top: 20px; font-size: 14px;">Primitive 2 · The checkpointer keys state to a session</h4>
+
+<pre class="diagram">
+config = {"configurable": {"thread_id": session_id}}
+async for ev in agent.astream_events(input, config=config, version="v2"):
+    ...
+</pre>
+
+  <p>
+    Every request uses the same <code class="inline">config</code>
+    shape with the user's session_id as <code class="inline">thread_id</code>.
+    The <code class="inline">MemorySaver</code> stores state in-process
+    keyed by thread_id. So the pause survives across HTTP requests ·
+    the server can end the SSE stream, serve other traffic, and a
+    future <code class="inline">/agent/resume</code> request finds the
+    state exactly where it was left.
+  </p>
+
+  <h4 style="margin-top: 20px; font-size: 14px;">Primitive 3 · Detecting the pause via <code class="inline">aget_state</code></h4>
+
+<pre class="diagram">
+# in services/planner/sse.py · after astream_events returns
+paused_state = await agent.aget_state(config)
+next_nodes = paused_state.next or ()
+if CAPTURE_NODE in next_nodes:
+    auth_id, amount_inr = extract_capture_intent(paused_state)
+    await queue.put({
+        "event": "agent.interrupt",
+        "data": json.dumps({"kind": "payment_approval",
+                            "auth_id": auth_id,
+                            "amount_inr": amount_inr}),
+    })
+    interrupted = True
+</pre>
+
+  <p>
+    <code class="inline">state.next</code> is a tuple of nodes LangGraph
+    is about to run. If <code class="inline">capture_payment</code> is
+    in there, we know we're paused at the gate. We emit
+    <code class="inline">agent.interrupt</code> over SSE so the frontend
+    can render the modal with the amount the user is about to authorize.
+  </p>
+
+  <h4 style="margin-top: 20px; font-size: 14px;">Approve · <code class="inline">/agent/resume</code></h4>
+
+<pre class="diagram">
+return EventSourceResponse(stream_agent_events(
+    agent_input=None,              # ◀── None = continue from checkpoint
+    session_id=req.session_id,
+))
+</pre>
+
+  <p>
+    Calling <code class="inline">astream_events(None, config=config, ...)</code>
+    tells LangGraph: "resume the saved state." The graph executes
+    CAPTURE_NODE for real (charges the card), routes back to
+    <code class="inline">model</code>, the model continues to calendar
+    + todos + final summary.
+  </p>
+
+  <h4 style="margin-top: 20px; font-size: 14px;">Cancel · <code class="inline">/agent/cancel</code> (the clever bit)</h4>
+
+  <p>
+    We don't want to throw the state away · we want the model to see
+    "the user said no" and respond gracefully. So we inject a
+    SYNTHETIC ToolMessage that looks like
+    <code class="inline">capture_payment</code> returned a decline:
+  </p>
+
+<pre class="diagram">
+decline_msg = ToolMessage(
+    tool_call_id=pending["id"],
+    content=json.dumps({"declined": True, "status": "user_cancelled",
+                        "reason": "User declined via approval modal."}),
+    name=CAPTURE_NODE,
+)
+await agent.aupdate_state(
+    config,
+    {"messages": [decline_msg]},
+    as_node=CAPTURE_NODE,          # ◀── "pretend CAPTURE_NODE ran and produced this"
+)
+return EventSourceResponse(stream_agent_events(agent_input=None, ...))
+</pre>
+
+  <p>
+    <code class="inline">aupdate_state(..., as_node=CAPTURE_NODE)</code>
+    mutates the saved state AS IF the capture node had executed and
+    returned that decline. Then we resume. The graph thinks
+    "ok, capture already ran, result was decline · advance to model."
+    The model sees the decline and wraps up the conversation politely.
+  </p>
+
+  <h4 style="margin-top: 20px; font-size: 14px;">The complete lifecycle</h4>
+
+<pre class="diagram">
+1.  POST /agent/stream {message: "Plan a Tokyo trip"}
+2.  SSE producer runs astream_events(input, config)
+3.  Model eventually emits capture_payment tool call
+4.  Router routes to CAPTURE_NODE
+5.  LangGraph sees interrupt_before → FREEZE state
+6.  astream_events returns naturally (no more events)
+7.  SSE checks aget_state(config).next → sees CAPTURE_NODE pending
+8.  SSE emits agent.interrupt {auth_id, amount_inr}
+9.  SSE emits state.phase: "awaiting_approval", run.complete
+10. Stream closes · server done with this request
+11. State sits in MemorySaver, keyed by session_id
+
+(user thinks for 30 seconds, looks at the modal)
+
+12a. APPROVE   → POST /agent/resume → astream_events(None, config)
+                 → CAPTURE_NODE runs for real → model continues
+12b. CANCEL    → POST /agent/cancel → inject synthetic decline via
+                 aupdate_state(as_node=CAPTURE_NODE) → resume
+                 → model sees decline → wraps up
+</pre>
+
+  <div class="callout">
+    <strong>The key insight:</strong> LangGraph treats HITL as a
+    graph-level pause, not an application-level await. Your application
+    doesn't sit blocking on <code class="inline">await user_input()</code>.
+    The graph FREEZES, the request ENDS, the server is free to handle
+    other traffic, and a future request resumes from the exact same
+    point because the checkpointer remembers everything (which tool
+    calls were pending, what args, what messages came before). Swap
+    <code class="inline">MemorySaver</code> for
+    <code class="inline">PostgresSaver</code> and the same pattern
+    survives planner restarts, multi-day waits, anything.
+  </div>
+
+  <!-- ─────────────── 4 · A2A call mechanics ─────────────── -->
+
+  <h3 style="margin-top: 36px;">4 · How an A2A call actually travels the wire</h3>
+
+  <p>
+    When the planner LLM calls <code class="inline">delegate_to_flight_agent("Search BLR to NRT...")</code>,
+    here's everything that happens between that decision and the
+    JSON result returning to the LLM.
+  </p>
+
+  <h4 style="margin-top: 20px; font-size: 14px;">The stack</h4>
+
+  <ul>
+    <li><strong><code class="inline">a2a-sdk</code></strong> (Google's official Python A2A SDK, v1.x). Zero hand-rolled HTTP on our side.</li>
+    <li><strong><code class="inline">httpx.AsyncClient</code></strong> as the underlying transport · one pooled instance shared across all A2A clients.</li>
+    <li><strong>JSON-RPC 2.0</strong> on the wire (agent's <code class="inline">POST /</code> endpoint).</li>
+  </ul>
+
+  <h4 style="margin-top: 20px; font-size: 14px;">One delegation · step by step (<code class="inline">shared/a2a_helpers/client.py</code>)</h4>
+
+<pre class="diagram">
+1. Get or create the cached Client
+   ─────────────────────────────────
+   async def _get_client(agent_url):
+       if agent_url not in _clients:
+           config = ClientConfig(httpx_client=_get_httpx_client())
+           _clients[agent_url] = await create_client(agent_url, client_config=config)
+       return _clients[agent_url]
+
+   create_client() fetches the Agent Card ONCE (for transport
+   negotiation), then constructs the right transport object.
+   Cached per URL · card fetch amortized across all delegations.
+
+2. Build a SendMessageRequest
+   ──────────────────────────
+   request = SendMessageRequest(
+       message=Message(
+           message_id=f"delegate-{uuid.uuid4().hex[:12]}",
+           role=Role.ROLE_USER,
+           parts=[Part(text=brief)],          # one text Part with the brief
+       ),
+   )
+
+3. Stream events from the agent
+   ─────────────────────────────
+   async for event in client.send_message(request):
+       if event.HasField("task"):              # final completed Task
+           final_text = ...status.message...
+           for art in task.artifacts:
+               _add_artifact(art)              # dedup by artifact_id
+       elif event.HasField("status_update"):
+           ...                                  # only in streaming agents
+       elif event.HasField("artifact_update"):
+           _add_artifact(event.artifact_update.artifact)
+       elif event.HasField("message"):
+           ...
+
+4. Return one clean dict
+   ──────────────────────
+   return {
+       "text": final_text,
+       "artifacts": [
+           {"name", "artifact_id", "text", "data", "data_parts"}
+       ],
+   }
+</pre>
+
+  <h4 style="margin-top: 20px; font-size: 14px;">What goes over the wire</h4>
+
+<pre class="diagram">
+POST http://flight-agent:8010/
+Content-Type: application/json
+
+{
+  "jsonrpc": "2.0",
+  "id": "<request-id>",
+  "method": "message/send",
+  "params": {
+    "message": {
+      "messageId": "delegate-a3f8...",
+      "role": "user",
+      "parts": [{"kind": "text", "text": "Search BLR to NRT..."}]
+    }
+  }
+}
+
+      │
+      ▼  flight-agent's internal LangGraph runs, calls mcp-airline, ...
+
+{
+  "jsonrpc": "2.0",
+  "id": "<request-id>",
+  "result": {
+    "id": "task-xyz",
+    "status": {
+      "state": "completed",
+      "message": {"parts": [{"text": "I recommend JL754..."}]}
+    },
+    "artifacts": [
+      {
+        "artifact_id": "art-1-search_flights",
+        "name": "search_flights",
+        "parts": [{"data": {"result": [{flight_id, ...}, ...]}}]
+      }
+    ]
+  }
+}
+</pre>
+
+  <h4 style="margin-top: 20px; font-size: 14px;">Key design choices</h4>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Choice</th>
+        <th>Why</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Long read timeout (180s)</td>
+        <td>Sub-agents do LLM + MCP round trips · 15-30s typical, 60s on cold starts. Default httpx 5s fails constantly.</td>
+      </tr>
+      <tr>
+        <td>One pooled <code class="inline">httpx.AsyncClient</code> shared</td>
+        <td>Connection pooling · avoids TLS handshake per request, faster repeat calls.</td>
+      </tr>
+      <tr>
+        <td>One <code class="inline">Client</code> cached per agent URL</td>
+        <td>Amortizes the Agent Card fetch + transport setup.</td>
+      </tr>
+      <tr>
+        <td>Dedupe artifacts by <code class="inline">artifact_id</code></td>
+        <td>Streaming can emit the same artifact in BOTH a task event AND an artifact_update event. Without dedup, frontend gets duplicate cards.</td>
+      </tr>
+      <tr>
+        <td>Return one async function (not a class)</td>
+        <td>Matches LangChain @tool shape · one await, one result. Caller doesn't deal with the SDK's event loop.</td>
+      </tr>
+      <tr>
+        <td>Protobuf <code class="inline">Value</code> quirk · ints arrive as floats</td>
+        <td>50000 → 50000.0. JS/TS doesn't care (Number is always double). Cast explicitly if Python needs ints.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h4 style="margin-top: 20px; font-size: 14px;">The big-picture path of one delegation</h4>
+
+<pre class="diagram">
+Planner LLM emits tool call: delegate_to_flight_agent("Search BLR to NRT...")
+                              │
+                              ▼
+        services/planner/dynamic_a2a_tools.py
+        (StructuredTool built from flight-agent's Agent Card at startup)
+                              │
+                              ▼
+        shared/a2a_helpers/client.py::delegate_to_a2a_agent(url, brief)
+                              │
+                              ▼
+        a2a-sdk Client.send_message(SendMessageRequest)
+                              │
+                              ▼
+        httpx.AsyncClient.post(JSON-RPC envelope)
+                              │
+                              ▼
+        flight-agent at port 8010 (FastAPI mount of A2ARESTFastAPIApplication)
+                              │
+                              ▼
+        flight-agent's internal LangGraph runs · calls mcp-airline · returns
+                              │
+                              ▼  (Task object with status + artifacts)
+        async iterator collects final_text + artifacts (dedup by artifact_id)
+                              │
+                              ▼
+        return {"text": ..., "artifacts": [...]} → json.dumps → string
+                              │
+                              ▼
+        Planner LLM sees JSON as the tool result · continues reasoning
+</pre>
+
+  <div class="callout">
+    <strong>One <code class="inline">await</code> from the LLM's perspective.</strong>
+    The whole round trip (Client lookup → JSON-RPC POST → sub-agent's
+    LangGraph → MCP call → Task assembly → event iteration → dict
+    construction) collapses behind one async function. Each layer
+    hides its own internal mess from the layer above. That's the
+    supervisor pattern done right · the planner doesn't know whether
+    flight-agent uses LangGraph or AutoGen or vanilla Python, what
+    MCP servers it talks to, or how its task lifecycle works. It just
+    awaits a brief and gets back text + artifacts.
+  </div>
+
   <div class="footer">
     Cohort artifact · Session 6 · Multi-Agent Orchestration
     · 6 A2A sub-agents + 5 MCP servers + 1 supervisor + voice + frontend.
