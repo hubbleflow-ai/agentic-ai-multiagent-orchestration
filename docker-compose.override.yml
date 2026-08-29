@@ -1,0 +1,35 @@
+# Host-port remap so Session 6 can run alongside the Session 4/5 stack.
+#
+# Only the HOST side of each mapping changes. Containers keep their original
+# internal ports, so every service-to-service URL on the `tripnet` network
+# (http://mcp-airline:9011/mcp, http://planner:8001, ...) is unaffected.
+#
+# Remapped because the host port is already taken:
+#   3000 -> 3002   Session 4/5 Next.js frontend on 3000, another node app on 3001
+#   6006 -> 6007   Session 4/5 Phoenix
+#   6379 -> 6380   Session 4/5 Redis
+#   8000 -> 8100   Session 4/5 ToDo Agent backend
+#
+# Everything else (8001, 8010-8018, 9011-9015) was free and is left alone.
+#
+# Compose merges this file automatically on `docker compose up`. Delete it to
+# go back to the stock ports.
+
+services:
+  redis:
+    ports: !override ["6380:6379"]
+
+  phoenix:
+    ports: !override ["6007:6006"]
+
+  concierge-voice:
+    ports: !override ["8100:8000"]
+
+  frontend:
+    ports: !override ["3002:3000"]
+    environment:
+      # These are baked into the browser bundle, so they must point at the
+      # REMAPPED host ports, not the internal ones.
+      NEXT_PUBLIC_VOICE_WS_URL: ws://localhost:8100/voice
+      NEXT_PUBLIC_AGENT_URL: http://localhost:8001/agent
+      NEXT_PUBLIC_TTS_URL: http://localhost:8100/tts/stream
