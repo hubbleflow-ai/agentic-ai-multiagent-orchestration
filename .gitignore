@@ -39,3 +39,17 @@ phoenix-data/
 
 # Logs
 *.log
+
+# Throwaway doc/notebook builders (same convention as the Session 4/5 repo)
+_build_*.py
+
+# Teaching material - kept on disk, never committed. This repo is code only:
+# backend, frontend, notebooks. Session recordings, architecture maps and
+# walkthrough docs live outside git.
+*.mov
+*.mp4
+session-*.html
+a2a-message-flow.html
+
+# Jupyter checkpoints
+.ipynb_checkpoints/

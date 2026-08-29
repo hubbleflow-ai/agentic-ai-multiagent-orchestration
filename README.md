@@ -94,6 +94,33 @@ docker compose up --build
 open http://localhost:3000
 ```
 
+## Notebooks
+
+Four teaching notebooks live in `notebooks/`. They are **clients and observers
+of the running mesh**, not reimplementations of it — every card, delegation
+and trace they show comes from the live containers. So bring the stack up
+first, then:
+
+```bash
+uv sync --extra notebooks
+uv run jupyter lab notebooks/
+```
+
+| Notebook | Teaches |
+|---|---|
+| `09_a2a_protocol.ipynb` | Agent Cards, the JSON-RPC envelope by hand, the Task lifecycle, Messages vs Artifacts |
+| `10_multi_agent_mesh.ipynb` | The 12-tool catalogue, card→tool synthesis, what stays hardcoded, shared state, the cross-service trace tree |
+| `11_human_in_the_loop.ipynb` | Why irreversible actions need an approver, and how the planner pauses for one |
+| `12_multi_agent_patterns.ipynb` | Four ways to arrange several agents, how control moves between them, and each one's failure mode |
+
+They continue the Session 4/5 ladder (`agentic-ai-introduction/backend/notebooks/`,
+`01`–`08`); `08_mcp_protocol.ipynb` is the MCP notebook these two build on.
+
+If you run them **outside** Docker, note that agents advertise their
+in-network URLs (`http://flight-agent:8010/`) in their Agent Cards. The
+notebooks address the host-mapped ports directly and explain the gap —
+see notebook 09, Steps 4 and 9.
+
 ## Repo layout
 
 ```
